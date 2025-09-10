@@ -82,7 +82,7 @@ async def webhook_df(request: Request, tasks: BackgroundTasks):
         return JSONResponse(content={"error": "Invalid request"}, status_code=400)
 
 
-@app.post("/api/sunfeast")
+@app.post("/api/yippee")
 async def webhook_sf(request: Request, tasks: BackgroundTasks):
     try:
         payload = await request.json()
@@ -220,7 +220,7 @@ async def get_generated_image_df(room_id: str):
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)
 
 
-@app.get("/sunfeast/image/{room_id}")
+@app.get("/yippee/image/{room_id}")
 async def get_generated_image_sf(room_id: str):
     print("get request started for sf")
 
