@@ -151,13 +151,13 @@ async def internal_mark_uploaded(p: MarkUploadedPayload):
 
     total_secs = (t_uploaded_utc - t_req).total_seconds()
     lag_minutes = int(total_secs // 60) if total_secs > 0 else 0
-
+    total_secs_int = int(total_secs)
     await coll.update_one(
         {"_id": doc["_id"]},
         {"$set": {
             "time_image_uploaded": t_uploaded_utc,   # UTC (aware)
             "time_image_saved_ist": t_uploaded_ist,  # IST (aware)
-            "lag": lag_minutes,
+            "lag": total_secs_int,
         }}
     )
     return {"ok": True, "lag": lag_minutes, "room_id": p.room_id}
