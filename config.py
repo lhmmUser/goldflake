@@ -31,4 +31,7 @@ class Settings:
     ENABLE_CHAT360_NOTIFY = _get("ENABLE_CHAT360_NOTIFY", "false").lower() == "true"
     CHAT360_URL_DF           = _get("CHAT360_URL_DF", "")  # leave empty if unused
     CHAT360_URL_YIPPEE       = _get("CHAT360_URL_YIPPEE", "")  # leave empty if unused
+
+    IP_ADAPTER = _get("IP_ADAPTER","SDXL/ip-adapter.bin")
+    PYTORCH_MODEL = _get("PYTORCH_MODEL","SDXL/instantid/diffusion_pytorch_model.safetensors")
 settings = Settings()

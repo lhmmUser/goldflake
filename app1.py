@@ -19,6 +19,8 @@ from config import settings
 s3 = get_s3_client()
 S3_BUCKET = settings.S3_BUCKET_DF
 S3_BUCKET_2 = settings.S3_BUCKET_YIPPEE
+IP_ADAPTER = settings.IP_ADAPTER
+PYTORCH_MODEL = settings.PYTORCH_MODEL
 
 def s3_key(sender, profile):
     ts = int(time.time())
@@ -177,6 +179,21 @@ def run_comfy_workflow_and_send_image(sender: str, name: str, gender: str, final
         print("❌ Failed to download/save selfie:", e)
         
         return
+        
+    
+    if "4" in jsonwf and "inputs" in jsonwf["4"]:
+            instantid_file_path = IP_ADAPTER
+            print(IP_ADAPTER, "IP_ADAPTER",
+                  instantid_file_path, "instantid_file_path")
+            jsonwf["4"]["inputs"]["instantid_file"] = instantid_file_path
+            print(
+                f"🧠 Injected instantid_file into node 4: {instantid_file_path}")
+
+    if "6" in jsonwf and "inputs" in jsonwf["4"]:
+            control_net_file_path = PYTORCH_MODEL
+            jsonwf["6"]["inputs"]["control_net_name"] = control_net_file_path
+            print(
+                f"🧠 Injected control_net_name into node 6: {control_net_file_path}")
 
     if "12" in jsonwf and "inputs" in jsonwf["12"]:
         jsonwf["12"]["inputs"]["image"] = user_image_rel_path.replace("\\", "/")
@@ -353,6 +370,20 @@ def run_comfy_workflow_and_send_image_sf(sender: str, name: str, gender: str, fi
         print("❌ Failed to download/save selfie:", e)
         
         return
+    
+    if "4" in jsonwf and "inputs" in jsonwf["4"]:
+            instantid_file_path = IP_ADAPTER
+            print(IP_ADAPTER, "IP_ADAPTER",
+                  instantid_file_path, "instantid_file_path")
+            jsonwf["4"]["inputs"]["instantid_file"] = instantid_file_path
+            print(
+                f"🧠 Injected instantid_file into node 4: {instantid_file_path}")
+
+    if "6" in jsonwf and "inputs" in jsonwf["4"]:
+            control_net_file_path = PYTORCH_MODEL
+            jsonwf["6"]["inputs"]["control_net_name"] = control_net_file_path
+            print(
+                f"🧠 Injected control_net_name into node 6: {control_net_file_path}")
 
     if "12" in jsonwf and "inputs" in jsonwf["12"]:
         jsonwf["12"]["inputs"]["image"] = user_image_rel_path.replace("\\", "/")
