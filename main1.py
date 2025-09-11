@@ -16,15 +16,11 @@ try:
     from zoneinfo import ZoneInfo
     IST = ZoneInfo("Asia/Kolkata")
 except Exception:
-    IST = timezone(timedelta(hours=5, minutes=30))
-    print("[time] tzdata not found; using fixed +05:30 for IST.")
+    IST = timezone(timedelta(hours=5, minutes=30), name="IST")
 
 def now_utc_and_ist():
-    """
-    Return aware UTC now and aware IST now (both datetime objects).
-    """
-    now_utc = datetime.now(timezone.utc)
-    now_ist = now_utc.astimezone(IST)
+    now_utc = datetime.now(timezone.utc)   # timezone-aware UTC
+    now_ist = now_utc.astimezone(IST)      # convert to IST
     return now_utc, now_ist
 
 # --- FastAPI app & S3 ---
@@ -71,7 +67,7 @@ async def webhook_df(request: Request, tasks: BackgroundTasks):
             "image_url": payload["selfie"],
             "room_id": payload["room_id"],
             "time_req_recieved": now_utc,          # UTC (aware)
-            "time_req_recieved_ist": now_ist,      # IST (aware)
+            "time_req_recieved_ist": now_ist.isoformat(),      # IST (aware)
             "instance": "df_2",
         }
         await users_collection.insert_one(user_entry)
@@ -115,7 +111,7 @@ async def webhook_sf(request: Request, tasks: BackgroundTasks):
             "room_id": payload["room_id"],
             "age": payload["age"],
             "time_req_recieved": now_utc,          # UTC (aware)
-            "time_req_recieved_ist": now_ist,      # IST (aware)
+            "time_req_recieved_ist": now_ist.isoformat(),      # IST (aware)
             "instance": "df_2",
         }
         await users_collection_yippee.insert_one(user_entry)
@@ -156,7 +152,7 @@ async def internal_mark_uploaded(p: MarkUploadedPayload):
         {"_id": doc["_id"]},
         {"$set": {
             "time_image_uploaded": t_uploaded_utc,   # UTC (aware)
-            "time_image_saved_ist": t_uploaded_ist,  # IST (aware)
+            "time_image_saved_ist": t_uploaded_ist.isoformat(),  # IST (aware)
             "lag": total_secs_int,
         }}
     )
@@ -166,9 +162,12 @@ async def internal_mark_uploaded(p: MarkUploadedPayload):
 @app.get("/chat360/image/{room_id}")
 async def get_generated_image_df(room_id: str):
     print("get request started for df")
-    prefix = "chat360/generated/"
 
-    # --- Log the GET call ---
+    base_prefix = "chat360/generated/"
+    # ✅ Only list keys for this room_id to avoid 1000-key page limit issues
+    search_prefix = f"{base_prefix}{room_id}_"
+
+    # --- Log the GET call (same fields as before) ---
     try:
         now_utc, now_ist = now_utc_and_ist()
         latest = await users_collection.find_one(
@@ -181,8 +180,8 @@ async def get_generated_image_df(room_id: str):
                 {
                     "$inc": {"get_count": 1},
                     "$push": {
-                        "time_get_req": now_utc,        # UTC (aware)
-                        "time_get_req_ist": now_ist,    # IST (aware)
+                        "time_get_req": now_utc,      # UTC (aware)
+                        "time_get_req_ist": now_ist.isoformat(),  # IST (aware)
                     },
                 },
             )
@@ -192,33 +191,30 @@ async def get_generated_image_df(room_id: str):
                 "get_count": 1,
                 "time_get_req": [now_utc],
                 "time_get_req_ist": [now_ist],
-                
             })
     except Exception as e:
         print("⚠️ Failed to log GET request (DF):", e)
 
-    # --- Fetch the latest image from S3 ---
+    # --- Fetch the latest image from S3 (paginate + newest by LastModified) ---
     try:
-        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        if "Contents" not in response:
-            return JSONResponse(content={"error": "No files found"}, status_code=404)
+        paginator = s3.get_paginator("list_objects_v2")
+        latest_obj = None
 
-        matched_files = [
-            obj for obj in response["Contents"]
-            if obj["Key"].startswith(f"{prefix}{room_id}_") and obj["Key"].endswith(".jpg")
-        ]
-        if not matched_files:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=search_prefix):
+            for obj in page.get("Contents", []):
+                if latest_obj is None or obj["LastModified"] > latest_obj["LastModified"]:
+                    latest_obj = obj
+
+        if not latest_obj:
             return JSONResponse(content={"error": "Image not found"}, status_code=404)
 
-        latest_obj = sorted(matched_files, key=lambda x: x["LastModified"], reverse=True)[0]
         print("latest image is generated")
-        image_data = s3.get_object(Bucket=S3_BUCKET, Key=latest_obj["Key"])["Body"].read()
-        return StreamingResponse(io.BytesIO(image_data), media_type="image/jpeg")
+        body = s3.get_object(Bucket=S3_BUCKET, Key=latest_obj["Key"])["Body"].read()
+        return StreamingResponse(io.BytesIO(body), media_type="image/jpeg")
 
     except Exception as e:
         print("❌ Error fetching from S3 (DF):", e)
         return JSONResponse(content={"error": "Internal server error"}, status_code=500)
-
 
 @app.get("/yippee/image/{room_id}")
 async def get_generated_image_sf(room_id: str):
@@ -239,7 +235,7 @@ async def get_generated_image_sf(room_id: str):
                     "$inc": {"get_count": 1},
                     "$push": {
                         "time_get_req": now_utc,        # UTC (aware)
-                        "time_get_req_ist": now_ist,    # IST (aware)
+                        "time_get_req_ist": now_ist.isoformat(),    # IST (aware)
                     },
                 },
             )

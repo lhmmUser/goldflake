@@ -347,8 +347,9 @@ def run_comfy_workflow_and_send_image_sf(sender: str, name: str, gender: str, fi
         print("⚠️ Node 3 missing or malformed; skipping weight injection.")
 
     if "68" in jsonwf and "inputs" in jsonwf["68"]:
-        caps_name = name.upper()
-        jsonwf["68"]["inputs"]["value"] = caps_name
+        name_clean = (name or "").strip()
+        proper_name = name_clean.capitalize()
+        jsonwf["68"]["inputs"]["value"] = proper_name
         print(f"📝 Injected name '{name}' into node 68.")
     else:
         print("⚠️ Node 68 not found or missing inputs.")
