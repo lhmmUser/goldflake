@@ -5,7 +5,7 @@ import io
 from datetime import datetime, timezone, timedelta
 from typing import Literal
 from pydantic import BaseModel
-
+from metrics_post import inc_if_post, start_publisher_thread
 from config import settings
 from s3_client import get_s3_client
 from db import users_collection, users_collection_yippee
@@ -28,6 +28,12 @@ app = FastAPI()
 s3 = get_s3_client()
 S3_BUCKET   = settings.S3_BUCKET_DF
 S3_BUCKET_2 = settings.S3_BUCKET_YIPPEE
+start_publisher_thread()
+
+@app.middleware("http")
+async def post_counter_mw(request: Request, call_next):
+    inc_if_post(request)
+    return await call_next(request)
 
 # --- Models ---
 class MarkUploadedPayload(BaseModel):
