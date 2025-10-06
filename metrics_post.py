@@ -1,144 +1,86 @@
-# metrics_post.py
-import os
-import time
-import threading
-import logging
-import socket
-from typing import Optional
-
-import boto3
-from botocore.config import Config
-import requests
+import os, threading, time, boto3, logging, socket
+from collections import deque
+from datetime import datetime, timezone
 from fastapi import Request
 
-# ------------------------- config -------------------------
-
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+ASG_NAME   = os.getenv("ASG_NAME", "df_yippe_template")
+NAMESPACE  = "App/HTTP"
+METRIC_MIN = "POSTPerMinute"
+METRIC_5M  = "POST5MinSum"
 
-# IMPORTANT: set this in your ASG user-data or .env to the *real* ASG name
-ASG_NAME = os.getenv("ASG_NAME", "df_yippe_template").strip()
-
-NAMESPACE   = "App/HTTP"          # must match your IAM policy condition
-METRIC_MIN  = "POSTPerMinute"     # 1-min count per instance + fleet
-
+# --- logging ---------------------------------------------------------------
 LOG_LEVEL = os.getenv("METRICS_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)s [metrics] %(message)s",
 )
 log = logging.getLogger("metrics")
-
 HOST = socket.gethostname()
 
-# ------------------- global state / clients ----------------
-
-_cw = boto3.client(
-    "cloudwatch",
-    region_name=AWS_REGION,
-    config=Config(retries={"max_attempts": 5, "mode": "standard"}),
-)
-
+# --- cw client & counters --------------------------------------------------
+_cw = boto3.client("cloudwatch", region_name=AWS_REGION)
 _lock = threading.Lock()
 _count = 0
-_started = False  # guard so we only start one publisher thread
+_last5 = deque(maxlen=5)  # stores the last five 1-minute counts
 
-# ------------------------- helpers ------------------------
-
-def _get_instance_id() -> str:
-    """Best-effort fetch of EC2 instance-id from IMDS (no error if not EC2)."""
-    try:
-        return requests.get(
-            "http://169.254.169.254/latest/meta-data/instance-id",
-            timeout=1,
-        ).text.strip()
-    except Exception:
-        return "unknown"
-
-INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip() or _get_instance_id()
-
-
-def _sleep_to_next_minute() -> None:
-    """Sleep so the loop wakes up on a neat 60s boundary."""
-    now = time.time()
-    delay = 60 - (now % 60)
-    if delay < 0.05:
-        delay = 0.05
-    time.sleep(delay)
-
-# ------------------------- API ----------------------------
-
-def inc_if_post(request: Request) -> None:
-    """
-    Call this from an HTTP middleware on every request.
-    Increments the counter for POST requests only.
-    """
-    if request.method.upper() == "POST":
-        global _count
+def inc_if_post(request: Request):
+    """Call this in a middleware for each request."""
+    global _count
+    if request.method == "POST":
         with _lock:
             _count += 1
 
-
-def _publisher_loop() -> None:
-    if not ASG_NAME:
-        log.warning(
-            "ASG_NAME is empty. Set ASG_NAME in env/user-data to your real Auto Scaling Group name!"
-        )
-
+def _publisher():
+    global _count
     log.info(
-        "publisher start: ns=%s metric=%s asg=%s instance=%s host=%s region=%s",
-        NAMESPACE, METRIC_MIN, ASG_NAME, INSTANCE_ID, HOST, AWS_REGION,
+        "publisher start: ns=%s min_metric=%s sum5_metric=%s asg=%s host=%s",
+        NAMESPACE, METRIC_MIN, METRIC_5M, ASG_NAME, HOST,
     )
-
     while True:
-        _sleep_to_next_minute()
-
+        time.sleep(60)
+        ts = datetime.now(timezone.utc)
         with _lock:
             c = _count
             _count = 0
+            _last5.append(c)
+            s5 = sum(_last5)
 
-        # human-readable trace
-        log.info("POST metrics: last_min=%d asg=%s instance=%s", c, ASG_NAME, INSTANCE_ID)
+        # human-readable snapshot in the logs
+        log.info(
+            "POST metrics: last_min=%d last5_sum=%d window=%s asg=%s",
+            c, s5, list(_last5), ASG_NAME
+        )
 
-        # publish per-instance + fleet aggregate (same metric name)
-        metric_data = [
-            {
-                "MetricName": METRIC_MIN,
-                "Dimensions": [
-                    {"Name": "AutoScalingGroupName", "Value": ASG_NAME},
-                    {"Name": "InstanceId", "Value": INSTANCE_ID},
-                ],
-                "Unit": "Count",
-                "Value": c,
-            },
-            {
-                "MetricName": METRIC_MIN,
-                "Dimensions": [
-                    {"Name": "AutoScalingGroupName", "Value": ASG_NAME},
-                ],
-                "Unit": "Count",
-                "Value": c,
-            },
-        ]
-
+        # publish both metrics at the same timestamp
         try:
-            _cw.put_metric_data(Namespace=NAMESPACE, MetricData=metric_data)
+            _cw.put_metric_data(
+                Namespace=NAMESPACE,
+                MetricData=[
+                    {
+                        "MetricName": METRIC_MIN,
+                        "Dimensions": [
+                            {"Name": "AutoScalingGroupName", "Value": ASG_NAME}
+                        ],
+                        "Timestamp": ts,
+                        "Unit": "Count",
+                        "Value": c,
+                    },
+                    {
+                        "MetricName": METRIC_5M,
+                        "Dimensions": [
+                            {"Name": "AutoScalingGroupName", "Value": ASG_NAME}
+                        ],
+                        "Timestamp": ts,
+                        "Unit": "Count",
+                        "Value": s5,
+                    },
+                ],
+            )
         except Exception as e:
-            # never interrupt serving traffic due to metrics; just log it
+            # log and keep going; we don't want to break request handling
             log.warning("put_metric_data failed: %s", e)
 
-
-def start_publisher_thread() -> None:
-    """
-    Start the background publisher exactly once per process.
-    Safe to call multiple times.
-    """
-    global _started
-    if _started:
-        return
-    _started = True
-    t = threading.Thread(
-        target=_publisher_loop,
-        name="cw-metrics-publisher",
-        daemon=True,
-    )
+def start_publisher_thread():
+    t = threading.Thread(target=_publisher, daemon=True)
     t.start()
