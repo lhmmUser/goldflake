@@ -28,12 +28,18 @@ app = FastAPI()
 s3 = get_s3_client()
 S3_BUCKET   = settings.S3_BUCKET_DF
 S3_BUCKET_2 = settings.S3_BUCKET_YIPPEE
-start_publisher_thread()
+
+# NOTE: moved start_publisher_thread() into a startup hook below
 
 @app.middleware("http")
 async def post_counter_mw(request: Request, call_next):
-    inc_if_post(request)
+    inc_if_post(request)  # counts only POST requests
     return await call_next(request)
+
+# Start metrics publisher exactly once per worker process
+@app.on_event("startup")
+async def _start_metrics():
+    start_publisher_thread()
 
 # --- Models ---
 class MarkUploadedPayload(BaseModel):
@@ -72,9 +78,9 @@ async def webhook_df(request: Request, tasks: BackgroundTasks):
             "archetype": payload["archetype"],
             "image_url": payload["selfie"],
             "room_id": payload["room_id"],
-            "time_req_recieved": now_utc,          # UTC (aware)
-            "time_req_recieved_ist": now_ist.isoformat(),      # IST (aware)
-            "instance": "df_6",
+            "time_req_recieved": now_utc,                  # UTC (aware)
+            "time_req_recieved_ist": now_ist.isoformat(),  # IST string
+            "instance": "df_2",
         }
         await users_collection.insert_one(user_entry)
         return {"status": "200 OK"}
@@ -116,9 +122,9 @@ async def webhook_sf(request: Request, tasks: BackgroundTasks):
             "image_url": payload["selfie"],
             "room_id": payload["room_id"],
             "age": payload["age"],
-            "time_req_recieved": now_utc,          # UTC (aware)
-            "time_req_recieved_ist": now_ist.isoformat(),      # IST (aware)
-            "instance": "df_6",
+            "time_req_recieved": now_utc,                  # UTC (aware)
+            "time_req_recieved_ist": now_ist.isoformat(),  # IST string
+            "instance": "df_2",
         }
         await users_collection_yippee.insert_one(user_entry)
         return {"status": "200 OK"}
@@ -157,8 +163,8 @@ async def internal_mark_uploaded(p: MarkUploadedPayload):
     await coll.update_one(
         {"_id": doc["_id"]},
         {"$set": {
-            "time_image_uploaded": t_uploaded_utc,   # UTC (aware)
-            "time_image_saved_ist": t_uploaded_ist.isoformat(),  # IST (aware)
+            "time_image_uploaded": t_uploaded_utc,            # UTC (aware)
+            "time_image_saved_ist": t_uploaded_ist.isoformat(),  # IST string
             "lag": total_secs_int,
         }}
     )
@@ -170,10 +176,9 @@ async def get_generated_image_df(room_id: str):
     print("get request started for df")
 
     base_prefix = "chat360/generated/"
-    # ✅ Only list keys for this room_id to avoid 1000-key page limit issues
     search_prefix = f"{base_prefix}{room_id}_"
 
-    # --- Log the GET call (same fields as before) ---
+    # --- Log the GET call ---
     try:
         now_utc, now_ist = now_utc_and_ist()
         latest = await users_collection.find_one(
@@ -186,8 +191,8 @@ async def get_generated_image_df(room_id: str):
                 {
                     "$inc": {"get_count": 1},
                     "$push": {
-                        "time_get_req": now_utc,      # UTC (aware)
-                        "time_get_req_ist": now_ist.isoformat(),  # IST (aware)
+                        "time_get_req": now_utc,                     # UTC (aware)
+                        "time_get_req_ist": now_ist.isoformat(),     # IST string
                     },
                 },
             )
@@ -201,7 +206,7 @@ async def get_generated_image_df(room_id: str):
     except Exception as e:
         print("⚠️ Failed to log GET request (DF):", e)
 
-    # --- Fetch the latest image from S3 (paginate + newest by LastModified) ---
+    # --- Fetch the latest image from S3 ---
     try:
         paginator = s3.get_paginator("list_objects_v2")
         latest_obj = None
@@ -227,7 +232,6 @@ async def get_generated_image_sf(room_id: str):
     print("get request started for sf")
 
     # --- Log the GET call ---
-    doc_latest = None
     try:
         now_utc, now_ist = now_utc_and_ist()
         doc_latest = await users_collection_yippee.find_one(
@@ -240,8 +244,8 @@ async def get_generated_image_sf(room_id: str):
                 {
                     "$inc": {"get_count": 1},
                     "$push": {
-                        "time_get_req": now_utc,        # UTC (aware)
-                        "time_get_req_ist": now_ist.isoformat(),    # IST (aware)
+                        "time_get_req": now_utc,                     # UTC (aware)
+                        "time_get_req_ist": now_ist.isoformat(),     # IST string
                     },
                 },
             )
@@ -251,12 +255,9 @@ async def get_generated_image_sf(room_id: str):
                 "get_count": 1,
                 "time_get_req": [now_utc],
                 "time_get_req_ist": [now_ist],
-                
             })
     except Exception as e:
         print("⚠️ Failed to log GET request (SF):", e)
-
-    
 
     try:
         for prefix in ("sunfeast/generated/", "chat360/generated/"):
@@ -272,7 +273,6 @@ async def get_generated_image_sf(room_id: str):
             image_data = s3.get_object(Bucket=S3_BUCKET_2, Key=key)["Body"].read()
             return StreamingResponse(io.BytesIO(image_data), media_type="image/jpeg")
 
-        # Nothing found anywhere
         return JSONResponse(content={"error": "Image not found"}, status_code=404)
 
     except Exception as e:
