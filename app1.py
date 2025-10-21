@@ -49,6 +49,12 @@ profile_to_folder = {
     "The Style Iconoclast": "df_si",
     "The Stage Stormer": "df_rs",
     "The Starbound Voyager": "df_sv",
+    "VAMPIRE":"df_vampire",
+    "CLOWN": "df_clown",
+    "WIZARD": "df_wizard",
+    "MUMMY": "df_mummy",
+    "ZOMBIE": "df_zombie",
+    "PIRATE":"df_pirate",
 }
 
 profile_to_folder_sf = {
