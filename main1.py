@@ -80,7 +80,7 @@ async def webhook_df(request: Request, tasks: BackgroundTasks):
             "room_id": payload["room_id"],
             "time_req_recieved": now_utc,                  # UTC (aware)
             "time_req_recieved_ist": now_ist.isoformat(),  # IST string
-            "instance": "df_2",
+            "instance": "df_encrypted",
         }
         await users_collection.insert_one(user_entry)
         return {"status": "200 OK"}
@@ -124,7 +124,7 @@ async def webhook_sf(request: Request, tasks: BackgroundTasks):
             "age": payload["age"],
             "time_req_recieved": now_utc,                  # UTC (aware)
             "time_req_recieved_ist": now_ist.isoformat(),  # IST string
-            "instance": "df_2",
+            "instance": "df_encrypted",
         }
         await users_collection_yippee.insert_one(user_entry)
         return {"status": "200 OK"}
