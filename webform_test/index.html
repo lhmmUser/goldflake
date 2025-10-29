@@ -1,0 +1,95 @@
+<!doctype html>
+<html>
+<head>
+  <title>Fantasy Profile Generator</title>
+</head>
+<body>
+  <h2>Generate Your Fantasy Image</h2>
+
+  <form id="f">
+    <label>Gender:
+      <select name="gender" required>
+        <option value="male">Male</option>
+        <option value="female">Female</option>
+      </select>
+    </label><br><br>
+
+    <label>Name: <input name="name" required></label><br><br>
+
+    <label>Phone Number: <input name="phone_number" required></label><br><br>
+
+    <label>S3 Image URL: <input name="image" type="url" style="width:350px" required></label><br><br>
+
+    <label>Fantasy Profile:
+      <select name="fantasy_profile" required>
+        <option>The Stage Stormer</option>
+        <option>The Golden Goal Seeker</option>
+        <option>The Wanted and Wild</option>
+        <option>The Strike Master</option>
+        <option>The Harley Howler</option>
+        <option>The Iron Gladiator</option>
+        <option>The Shadow Striker</option>
+        <option>The Hopeless Romantic</option>
+        <option>The Style Iconoclast</option>
+        <option>The Starbound Voyager</option>
+      </select>
+    </label><br><br>
+
+    <button type="submit">Generate</button>
+  </form>
+
+  <pre id="log" style="margin-top:20px;"></pre>
+  <img id="out" style="max-width:400px; margin-top:10px; display:block;" />
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+
+    document.getElementById('f').onsubmit = async e => {
+      e.preventDefault();
+      $('log').textContent = 'Submitting...';
+      $('out').src = '';
+
+      const data = Object.fromEntries(new FormData(e.target));
+      data.client_job_id = uid();
+
+      try {
+        const r = await fetch('/generate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(data)
+        });
+
+        if (!r.ok) {
+          const err = await r.text();
+          $('log').textContent = `❌ Error ${r.status}\n${err}`;
+          return;
+        }
+
+        const { server_job_id, status_url } = await r.json();
+        $('log').textContent = `✅ Job Queued: ${server_job_id}`;
+
+        let done = false;
+        while (!done) {
+          const poll = await fetch(status_url);
+          const result = await poll.json();
+
+          $('log').textContent = JSON.stringify(result, null, 2);
+
+          if (result.status === 'done') {
+            $('out').src = result.result;
+            done = true;
+          } else if (result.status === 'failed') {
+            $('log').textContent = "❌ Failed: " + result.result;
+            done = true;
+          }
+
+          await new Promise(res => setTimeout(res, 1500));
+        }
+      } catch (err) {
+        $('log').textContent = `❌ Unexpected error: ${err}`;
+      }
+    };
+  </script>
+</body>
+</html>
