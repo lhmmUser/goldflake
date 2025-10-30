@@ -165,8 +165,15 @@ async def webhook_goldflake(request: Request, tasks: BackgroundTasks):
         g2 = norm_p2["gender"]
         p1_selfie = norm_p1["image_url"]
         p2_selfie = norm_p2["image_url"]
+        
+        if g1 == "female" and g2 == "male":
+            g1, g2 =g2, g1
+            p1_selfie, p2_selfie = p2_selfie, p1_selfie
+            combined_gender_folder = f"{g1}_{g2}"
 
-        combined_gender_folder = f"{g1}_{g2}"
+        else:
+            combined_gender_folder = f"{g1}_{g2}"
+        
         if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
             return JSONResponse(
                 {"error": f"Invalid gender combination: {combined_gender_folder}"},

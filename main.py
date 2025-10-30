@@ -3,6 +3,7 @@ import httpx
 import os
 import logging
 import uuid
+import time
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional
 from app1 import run_comfy_workflow_and_send_image_goldflake
@@ -29,10 +30,14 @@ load_dotenv()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+SESSION_TTL_SECONDS = 30      # 30 minutes since last activity
+SESSION_POST_DONE_GRACE = 20    # after we send final image, keep state for 5 minutes
 SESSIONS: Dict[str, Dict[str, Any]] = {} 
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_GF_BUCKET = os.getenv("S3_GF_BUCKET") or os.environ["S3_GF_BUCKET"]
 GRAPH_BASE = "https://graph.facebook.com/v21.0" 
+
+
 
 # --- LOGGING CONFIG ---
 logging.basicConfig(
@@ -43,6 +48,74 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _s3 = boto3.client("s3", region_name=AWS_REGION)
+
+def _now() -> float:
+    return time.time()
+
+def _new_session() -> Dict[str, Any]:
+    # default fresh session
+    return {
+        "stage": "t_and_c",
+        "scene": None,
+        "name": None,
+        "gender": None,
+        "buddy_name": None,
+        "buddy_gender": None,
+        "room_id": None,
+        "created_at": _now(),
+        "updated_at": _now(),
+        "expires_at": _now() + SESSION_TTL_SECONDS,
+        "status": "active",        # "active" | "done" | "expired"
+        "end_reason": None,
+    }
+
+def get_session(phone: str) -> Dict[str, Any]:
+    s = SESSIONS.get(phone)
+    now = _now()
+    if not s:
+        s = _new_session()
+        SESSIONS[phone] = s
+        return s
+
+    # Expire if needed
+    if s.get("expires_at") and now > s["expires_at"]:
+        # drop and recreate
+        SESSIONS.pop(phone, None)
+        s = _new_session()
+        SESSIONS[phone] = s
+        return s
+
+    # touch
+    s["updated_at"] = now
+    # extend TTL while active
+    if s.get("status") == "active":
+        s["expires_at"] = now + SESSION_TTL_SECONDS
+    return s
+
+def end_session(phone: str, reason: str = "completed") -> None:
+    """
+    Mark session as done, and schedule expiry shortly after.
+    This keeps a small grace window so you can read state if needed.
+    """
+    s = SESSIONS.get(phone)
+    if not s:
+        return
+    now = _now()
+    s["status"] = "done"
+    s["end_reason"] = reason
+    s["updated_at"] = now
+    s["expires_at"] = now + SESSION_POST_DONE_GRACE
+    s["stage"] = "done"
+
+def reset_session(phone: str) -> Dict[str, Any]:
+    """
+    Hard reset: delete existing and create a brand new session.
+    """
+    SESSIONS.pop(phone, None)
+    s = _new_session()
+    SESSIONS[phone] = s
+    return s
+
 
 def guess_ct(path: str) -> str:
     ct, _ = mimetypes.guess_type(path)
@@ -96,17 +169,7 @@ def presign_get_url(key: str, expires: int = 3600) -> str:
         ExpiresIn=expires,
     )
 
-def get_session(phone: str) -> Dict[str, Any]:
-    if phone not in SESSIONS:
-        SESSIONS[phone] = {
-            "stage": "t_and_c",  # next step: T&C (will be set to scene after agree)
-            "scene": None,
-            "name": None,
-            "gender": None,
-            "buddy_name": None,
-            "buddy_gender": None,
-        }
-    return SESSIONS[phone]
+
 
 @app.middleware("http")
 async def access_log(request: Request, call_next):
@@ -116,9 +179,9 @@ async def access_log(request: Request, call_next):
         body = await request.body()
     except Exception:
         pass
-    logger.info(f"[ACCESS] {request.method} {request.url.path} | headers={dict(request.headers)} | body={body[:500]}")
+    # logger.info(f"[ACCESS] {request.method} {request.url.path} | headers={dict(request.headers)} | body={body[:500]}")
     resp = await call_next(request)
-    logger.info(f"[ACCESS] {request.method} {request.url.path} -> {resp.status_code}")
+    # logger.info(f"[ACCESS] {request.method} {request.url.path} -> {resp.status_code}")
     return resp
 
 @app.get("/root")
@@ -461,8 +524,16 @@ async def webhook_goldflake(
         g2 = (norm_p2["gender"] or "").strip().lower()                        # normalized p2 gender
         p1_in = norm_p1["image_url"]                                          # normalized p1 selfie (raw input shape)
         p2_in = norm_p2["image_url"]                                          # normalized p2 selfie (raw input shape)
-
-        combined_gender_folder = f"{g1}_{g2}"                                 # folder key like male_female
+        print (g1,g2)
+        if g1 == "female" and g2 == "male":
+            g1, g2 =g2, g1
+            p1_selfie, p2_selfie = p2_selfie, p1_selfie
+            combined_gender_folder = f"{g1}_{g2}"
+            print ("exchanged",combined_gender_folder)
+        else:
+            combined_gender_folder = f"{g1}_{g2}"                                         # normalized p2 selfie (raw input shape)
+            print ("not exchanged",combined_gender_folder)
+                                       # folder key like male_female
         if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
             err = f"Invalid gender combination: {combined_gender_folder}"
             logger.error(f"[goldflake] {err}")
@@ -581,6 +652,25 @@ async def webhook_goldflake(
         logger.exception(f"[goldflake] webhook_goldflake error: {e}")         # top-level guard
         return {"error": "Invalid request"}                                    # safe error
 
+async def send_restart_button(to_phone: str):
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": "Start over?"},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "restart_flow", "title": "Restart"}},
+                ]
+            },
+        },
+    }
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(url, headers=headers, json=payload)
 
 # --- RECEIVE WHATSAPP WEBHOOK ---
 @app.post("/webhook")
@@ -619,127 +709,103 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     f"Incoming message from {from_phone} | Type: {msg_type} | Stage: {session['stage']}"
                 )
 
+
+
                 # =========================
                 # BUTTON / INTERACTIVE REPLIES
                 # =========================
+
+                choice_id = None
+                raw_text = None
+                lower = None
+
                 if msg_type == "interactive":
-                    interactive = msg.get("interactive", {}) or {}          # interactive object
-                    button_reply = interactive.get("button_reply")           # only handling button replies here
-                    if not button_reply:                                     # list replies can be handled similarly
-                        logger.info(f"No button_reply (maybe list reply) from {from_phone}; ignoring.")
-                        continue
+                    interactive = (msg.get("interactive") or {})
+                    btn = interactive.get("button_reply")
+                    if btn:
+                        choice_id = btn.get("id")
 
-                    choice_id = button_reply.get("id")                       # chosen button id
-                    logger.info(f"[BUTTON] from={from_phone} id={choice_id} stage={session['stage']}")
+                elif msg_type == "text":
+                    raw_text = ((msg.get("text") or {}).get("body") or "")
+                    lower = raw_text.strip().lower()
 
-                    # T&C agree/disagree handling
+                # --- GLOBAL RESTART: works from any stage ---
+                if choice_id == "restart_flow" or (lower in {"restart", "reset", "start over", "startover","hi"} if lower is not None else False):
+                    logger.info(f"[RESTART] by {from_phone} (prev stage={session.get('stage')}, status={session.get('status')})")
+                    reset_session(from_phone)
+                    background_tasks.add_task(send_terms_and_conditions_question, from_phone)
+                    continue  # do not fall through
+
+                # --- DONE NUDGE: only after restart branch ---
+                if session.get("status") == "done":
+                    background_tasks.add_task(send_text, from_phone, "This session is finished. Reply *restart* to begin again.")
+                    background_tasks.add_task(send_restart_button, from_phone)
+                    continue
+
+                # --- INTERACTIVE (stage-specific) ---
+                if msg_type == "interactive" and choice_id:
+                    st = session.get("stage")
+
                     if choice_id == "agree_yes":
-                        session["stage"] = "q_scene"                          # advance to scene question
+                        session["stage"] = "q_scene"
                         background_tasks.add_task(send_text, from_phone, "Great! ✅ Let’s begin.")
-                        background_tasks.add_task(send_scene_question, from_phone)  # ask scene
+                        background_tasks.add_task(send_scene_question, from_phone)
                         continue
 
                     if choice_id == "agree_no":
-                        session["stage"] = "t_and_c"                          # back to T&C stage
-                        background_tasks.add_task(
-                            send_text,
-                            from_phone,
-                            "No worries. You can come back anytime to accept and continue 👋",
-                        )
+                        session["stage"] = "t_and_c"
+                        background_tasks.add_task(send_text, from_phone, "No worries. You can come back anytime to accept and continue 👋")
                         continue
 
-                    # Scene selection (chai / rooftop)
-                    if session["stage"] == "q_scene" and choice_id in {"scene_chai", "scene_rooftop"}:
-                        session["scene"] = "chai" if choice_id == "scene_chai" else "rooftop"  # store scene
-                        logger.info(f"{from_phone} chose scene={session['scene']}")
-                        session["stage"] = "q_name"                           # move to name ask
+                    if st == "q_scene" and choice_id in {"scene_chai", "scene_rooftop"}:
+                        session["scene"] = "chai" if choice_id == "scene_chai" else "chai_2"
+                        session["stage"] = "q_name"
                         background_tasks.add_task(send_name_question, from_phone)
                         continue
 
-                    # User gender selection
-                    if session["stage"] == "q_gender" and choice_id in {"gender_me_male", "gender_me_female"}:
-                        session["gender"] = "male" if choice_id == "gender_me_male" else "female"  # store gender
-                        logger.info(f"{from_phone} gender={session['gender']}")
-                        session["stage"] = "q_buddy_name"                    # ask buddy's name next
+                    if st == "q_gender" and choice_id in {"gender_me_male", "gender_me_female"}:
+                        session["gender"] = "male" if choice_id == "gender_me_male" else "female"
+                        session["stage"] = "q_buddy_name"
                         background_tasks.add_task(send_buddy_name_question, from_phone)
                         continue
 
-                    # Buddy gender selection
-                    if session["stage"] == "q_buddy_gender" and choice_id in {"gender_buddy_male", "gender_buddy_female"}:
-                        session["buddy_gender"] = "male" if choice_id == "gender_buddy_male" else "female"  # store buddy gender
-                        logger.info(f"{from_phone} buddy_gender={session['buddy_gender']}")
-                        session["stage"] = "q_user_image"                    # now ask for user's image
-                        background_tasks.add_task(
-                            send_text, from_phone, "Please send **your photo** now (as an image)."
-                        )
+                    if st == "q_buddy_gender" and choice_id in {"gender_buddy_male", "gender_buddy_female"}:
+                        session["buddy_gender"] = "male" if choice_id == "gender_buddy_male" else "female"
+                        session["stage"] = "q_user_image"
+                        background_tasks.add_task(send_text, from_phone, "Please send **your photo** now (as an image).")
                         continue
 
-                    # Unexpected button for current stage → re-prompt appropriately
-                    logger.warning(f"Unexpected button id for stage {session['stage']}: {choice_id}")
-                    st = session["stage"]
-                    if st == "t_and_c":
+                    # fallback for unexpected button
+                    background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
+                    continue
+
+                # --- TEXT (stage-specific) ---
+                if msg_type == "text" and lower is not None:
+                    st = session.get("stage")
+
+                    if st == "t_and_c" and lower in {"hi", "hello", "hey", "heyy", "hii"}:
                         background_tasks.add_task(send_terms_and_conditions_question, from_phone)
-                    elif st == "q_scene":
-                        background_tasks.add_task(send_scene_question, from_phone)
-                    elif st == "q_name":
-                        background_tasks.add_task(send_name_question, from_phone)
-                    elif st == "q_gender":
-                        background_tasks.add_task(send_gender_question, from_phone)
-                    elif st == "q_buddy_name":
-                        background_tasks.add_task(send_buddy_name_question, from_phone)
-                    elif st == "q_buddy_gender":
-                        background_tasks.add_task(send_buddy_gender_question, from_phone)
-                    else:
-                        background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
-                    continue  # move to next message
-
-                # =========================
-                # PLAIN TEXT MESSAGES
-                # =========================
-                if msg_type == "text":
-                    raw_text = (msg.get("text", {}) or {}).get("body", "")    # read text body
-                    user_text = raw_text.strip()                              # trim whitespace
-                    lower = user_text.lower()                                 # lower-cased
-                    logger.info(f"[TEXT] from={from_phone} text='{user_text}' stage={session['stage']}")
-
-                    # Gate: conversation starts with greeting at T&C stage
-                    if session["stage"] == "t_and_c":
-                        if lower in {"hi", "hey", "hello", "heyy", "hii"}:
-                            logger.info(f"Starter detected from {from_phone}. Sending T&C.")
-                            background_tasks.add_task(send_terms_and_conditions_question, from_phone)  # send T&C
-                        else:
-                            logger.info(f"Ignored message before starter from {from_phone}: '{user_text}'")
                         continue
 
-                    # Capture user's name
-                    if session["stage"] == "q_name":
-                        if 1 <= len(user_text) <= 60:                         # simple validation
-                            session["name"] = user_text                       # store name
-                            logger.info(f"{from_phone} name='{session['name']}'")
-                            session["stage"] = "q_gender"                     # ask for user's gender
+                    if st == "q_name":
+                        if 1 <= len(raw_text.strip()) <= 60:
+                            session["name"] = raw_text.strip()
+                            session["stage"] = "q_gender"
                             background_tasks.add_task(send_gender_question, from_phone)
                         else:
-                            background_tasks.add_task(
-                                send_text, from_phone, "Please send a valid name (1–60 characters)."
-                            )
+                            background_tasks.add_task(send_text, from_phone, "Please send a valid name (1–60 characters).")
                         continue
 
-                    # Capture buddy's name
-                    if session["stage"] == "q_buddy_name":
-                        if 1 <= len(user_text) <= 60:                         # simple validation
-                            session["buddy_name"] = user_text                 # store buddy name
-                            logger.info(f"{from_phone} buddy_name='{session['buddy_name']}'")
-                            session["stage"] = "q_buddy_gender"              # ask buddy gender next
+                    if st == "q_buddy_name":
+                        if 1 <= len(raw_text.strip()) <= 60:
+                            session["buddy_name"] = raw_text.strip()
+                            session["stage"] = "q_buddy_gender"
                             background_tasks.add_task(send_buddy_gender_question, from_phone)
                         else:
-                            background_tasks.add_task(
-                                send_text, from_phone, "Please send a valid buddy name (1–60 characters)."
-                            )
+                            background_tasks.add_task(send_text, from_phone, "Please send a valid buddy name (1–60 characters).")
                         continue
 
-                    # For other unexpected text, gently re-prompt based on stage
-                    st = session["stage"]
-                    logger.info(f"Unexpected text for stage {st} from {from_phone}; re-prompting.")
+                    # generic re-prompts
                     if st == "q_scene":
                         background_tasks.add_task(send_scene_question, from_phone)
                     elif st == "q_gender":
@@ -752,8 +818,24 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_text, from_phone, "You’re all set already. 🙌")
                     else:
                         background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
-                    continue  # next message
+                    continue
 
+                # --- GLOBAL RESTART: button or keywords should work from ANY stage ---
+                if choice_id == "restart_flow" or (lower in {"restart", "reset", "start over", "startover"} if lower else False):
+                    logger.info(f"[RESTART] by {from_phone} (prev stage={session.get('stage')}, status={session.get('status')})")
+                    reset_session(from_phone)  # brand new session with stage=t_and_c, status=active
+                    background_tasks.add_task(send_terms_and_conditions_question, from_phone)
+                    continue  # DO NOT fall through
+
+                # --- DONE NUDGE: only after giving the restart branch a chance ---
+                if session.get("status") == "done":
+                    background_tasks.add_task(
+                        send_text,
+                        from_phone,
+                        "This session is finished. Reply *restart* to begin again."
+                    )
+                    background_tasks.add_task(send_restart_button, from_phone)
+                    continue
                 # =========================
                 # IMAGES (WhatsApp media)
                 # =========================
@@ -885,7 +967,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 upload_key = s3_key(room_id, scene)  # e.g., chat360/generated/<room_id>_<scene>_<ts>.jpg
 
                                 # 🔸 2) compute gender folder expected by your generator
-                                combined_gender_folder = f"{user_gender.lower()}_{buddy_gender.lower()}"
+                                g1 = user_gender.lower().strip()
+                                g2 = buddy_gender.lower().strip()
+                                if g1 == "female" and g2 == "male":
+                                    g1, g2 =g2, g1
+                                    p1_url, p2_url = p2_url, p1_url
+                                    combined_gender_folder = f"{g1}_{g2}"
+                                    print ("exchanged in generate_and_send")
+                                else:
+                                    combined_gender_folder = f"{g1}_{g2}"
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(from_phone, "Invalid gender combination.")
                                     return
@@ -924,7 +1014,17 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     caption=f"{scene.title()} | Tap to view",
                                 )
                                 # mark session stage elsewhere as 'done' if you keep that state machine
-
+                                
+                                end_session(from_phone, reason="completed_success")
+                                try:
+                                    await send_text(
+                                        from_phone,
+                                        "✅ Done! If you want to start again, reply *restart* or tap the button below."
+                                    )
+                                    # optional: send a restart button
+                                    await send_restart_button(from_phone)
+                                except Exception:
+                                    pass
                             except Exception as e:
                                 logger.exception(f"[goldflake] Failed to generate/send image: {e}")
                                 try:
