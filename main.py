@@ -21,7 +21,8 @@ from io import BytesIO
 from PIL import Image
 import boto3
 import asyncio
-from typing import Coroutine, Any
+from datetime import datetime, timezone, timedelta
+from typing import Coroutine, Any, Dict, Any, Optional
 from app1 import run_comfy_workflow_and_send_image_goldflake, s3_key
 from db import users_collection, users_collection_yippee, users_collection_goldflake
 app = FastAPI()
@@ -37,7 +38,10 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_GF_BUCKET = os.getenv("S3_GF_BUCKET") or os.environ["S3_GF_BUCKET"]
 GRAPH_BASE = "https://graph.facebook.com/v21.0" 
 
-
+# in-memory stores (you may replace with persistent DB later)
+_sessions_active: Dict[str, Dict[str, Any]] = {}   # phone_key -> active session dict
+_sessions_archived: Dict[str, list] = {}          # phone_key -> list of finished sessions
+_session_locks: Dict[str, asyncio.Lock] = {}      # phone_key -> asyncio.Lock to avoid races
 
 # --- LOGGING CONFIG ---
 logging.basicConfig(
@@ -116,6 +120,102 @@ def reset_session(phone: str) -> Dict[str, Any]:
     SESSIONS[phone] = s
     return s
 
+def normalize_phone_key(phone: str) -> str:
+    """Normalize phone to digits-only to use as dictionary keys consistently."""
+    if not phone:
+        return ""
+    digits = re.sub(r"\D", "", phone)
+    return digits
+
+def _get_lock(phone_key: str) -> asyncio.Lock:
+    """Get (or create) an asyncio.Lock for this phone to avoid concurrent session races."""
+    lock = _session_locks.get(phone_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[phone_key] = lock
+    return lock
+
+def now_utc_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+def now_ist_iso() -> str:
+    ist = datetime.now(tz=timezone.utc) + timedelta(hours=5, minutes=30)
+    return ist.isoformat()
+
+async def start_new_session(from_phone: str, initial_stage: str = "t_and_c", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Create a new session for from_phone ONLY at the start of a flow.
+    Returns the created session dict (and stores it in _sessions_active).
+    """
+    phone_key = normalize_phone_key(from_phone)
+    async with _get_lock(phone_key):
+        # If an active session already exists, we will end it and archive it.
+        if phone_key in _sessions_active:
+            # archive old active session before starting a fresh one
+            old = _sessions_active.pop(phone_key)
+            _sessions_archived.setdefault(phone_key, []).append(old)
+
+        room_id = uuid.uuid4().hex
+        now_utc = now_utc_iso()
+        now_ist = now_ist_iso()
+        session = {
+            "room_id": room_id,
+            "wa_phone": from_phone,
+            "phone_key": phone_key,
+            "stage": initial_stage,
+            "created_at_utc": now_utc,
+            "created_at_ist": now_ist,
+            "updated_at_utc": now_utc,
+            "updated_at_ist": now_ist,
+            # placeholders for user fields - fill as you collect them
+            "person1_name": None,
+            "person1_gender": None,
+            "person1_selfie": None,
+            "person2_name": None,
+            "person2_gender": None,
+            "person2_selfie": None,
+            "archetype": None,
+            "combined_gender": None,
+        }
+        # merge extra if provided
+        if extra:
+            session.update(extra)
+
+        _sessions_active[phone_key] = session
+        # optional: persist snapshot in DB immediately
+        # background_tasks.add_task(save_session_snapshot, phone_key, session)
+        return session
+
+def get_active_session(from_phone: str) -> Optional[Dict[str, Any]]:
+    """Return the active session (in-memory) for from_phone or None."""
+    phone_key = normalize_phone_key(from_phone)
+    return _sessions_active.get(phone_key)
+
+async def end_session(from_phone: str, reason: str = "completed") -> Optional[Dict[str, Any]]:
+    """
+    End the active session for a phone.
+    - Moves it to archived list and removes from active.
+    - Returns the archived session (or None if none existed).
+    """
+    phone_key = normalize_phone_key(from_phone)
+    async with _get_lock(phone_key):
+        session = _sessions_active.pop(phone_key, None)
+        if not session:
+            return None
+        session["ended_at_utc"] = now_utc_iso()
+        session["ended_at_ist"] = now_ist_iso()
+        session["end_reason"] = reason
+        session["updated_at_utc"] = session["ended_at_utc"]
+        session["updated_at_ist"] = session["ended_at_ist"]
+        _sessions_archived.setdefault(phone_key, []).append(session)
+        # optional: persist final snapshot to DB
+        # await save_session_snapshot(phone_key, session)  # if save_session_snapshot is async
+        return session
+
+# Optional utility: find previous sessions (archived)
+def list_archived_sessions(from_phone: str) -> list:
+    phone_key = normalize_phone_key(from_phone)
+    return _sessions_archived.get(phone_key, []).copy()
 
 def guess_ct(path: str) -> str:
     ct, _ = mimetypes.guess_type(path)
@@ -202,6 +302,100 @@ def verify_webhook(
     logger.warning("Unauthorized webhook verification attempt.")
     return {"status": "unauthorized"}
 
+def _combined_gender(g1: str | None, g2: str | None) -> str | None:
+    g1 = (g1 or "").strip().lower()
+    g2 = (g2 or "").strip().lower()
+    if not g1 or not g2:
+        return None
+    # normalize to male_female if pair is mixed; order male_female when mixed
+    if {g1, g2} == {"male", "female"}:
+        return "male_female"
+    if g1 == "male" and g2 == "male":
+        return "male_male"
+    if g1 == "female" and g2 == "female":
+        return "female_female"
+    return None
+
+
+async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
+    """
+    Upsert a concise interaction snapshot for analytics/audit.
+    - Keyed by room_id, so we keep one evolving record per flow.
+    - Safe to call frequently; only updates changed fields.
+    """
+    # ensure we have a room_id early; generate if missing
+    room_id = session.get("room_id") or uuid.uuid4().hex
+    session["room_id"] = room_id
+
+    # names & genders
+    p1_name = session.get("name")
+    p2_name = session.get("buddy_name")
+    p1_gender = (session.get("gender") or "").strip().lower() or None
+    p2_gender = (session.get("buddy_gender") or "").strip().lower() or None
+
+    # selfies (prefer presigned URLs if present)
+    p1_selfie = session.get("user_image_url") or session.get("user_image_path")
+    p2_selfie = session.get("buddy_image_url") or session.get("buddy_image_path")
+
+    # archetype/scene
+    archetype = (session.get("scene") or None)
+
+    # combined gender if both known
+    combined = _combined_gender(p1_gender, p2_gender)
+
+     # final image url & status (may be absent until generation completes)
+    final_image = session.get("final_image_url") or session.get("final_image")
+    status = session.get("status") or None
+    end_reason = session.get("end_reason") or None
+    ended_at_utc = session.get("ended_at_utc") or None
+    ended_at_ist = session.get("ended_at_ist") or None
+
+    # timestamps (reuse your existing helper)
+    now_utc, now_ist = now_utc_and_ist()
+
+    doc_set = {
+        "campaign": "goldflake",
+        "instance": "df_encrypted",
+        "wa_phone": wa_phone,
+        "room_id": room_id,
+        "person1_name": p1_name,
+        "person2_name": p2_name,
+        "person1_gender": p1_gender,
+        "person2_gender": p2_gender,
+        "person1_selfie": p1_selfie,  # can be presigned URL or local path (early stages)
+        "person2_selfie": p2_selfie,
+        "archetype": archetype,       # 'chai' or 'chai_2' as you set today
+        "combined_gender": combined,  # male_male | male_female | female_female | None
+        "stage": session.get("stage"),
+        # final image + status fields (only None if not set)
+        "final_image_url": final_image,
+        "status": status,
+        "end_reason": end_reason,
+        "ended_at_utc": ended_at_utc,
+        "ended_at_ist": ended_at_ist,
+        # keep both the “request received” (first seen) and rolling updated-at
+        "time_req_recieved": session.get("time_req_recieved") or now_utc,
+        "time_req_recieved_ist": session.get("time_req_recieved_ist") or now_ist.isoformat(),
+        "updated_at_utc": now_utc,
+        "updated_at_ist": now_ist.isoformat(),
+
+    }
+
+    # set-on-insert once; update the rest each snapshot
+    soi = {
+        "created_at_utc": session.get("created_at_utc") or now_utc,
+        "created_at_ist": session.get("created_at_ist") or now_ist.isoformat(),
+    }
+
+    try:
+        await users_collection_goldflake.update_one(
+            {"room_id": room_id},
+            {"$set": doc_set, "$setOnInsert": soi},
+            upsert=True,
+        )
+        logger.debug(f"[snapshot] upserted room_id={room_id} status={status} final_image={'YES' if final_image else 'NO'}")
+    except Exception as e:
+        logger.exception(f"[snapshot] upsert failed for room_id={room_id}: {e}")
 
 # --- SEND BUTTON MESSAGE ---
 async def send_terms_and_conditions_question(to_phone: str):
@@ -209,7 +403,7 @@ async def send_terms_and_conditions_question(to_phone: str):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     body_text = (
         "Welcome to the world of Snow Flake 🔮– where every bite is a portal to your wildest & spookiest imaginations\n\n"
-        "👩‍🎤 Find your Halloween Fantasy avatar and stand a chance to win Amazon vouchers worth Rs. 10,000 every week!🏆\n"
+        "👩‍🎤 Find your Fantasy avatar and stand a chance to win Amazon vouchers worth Rs. 10,000 every week!🏆\n"
         "Accept terms and conditions to proceed:"
     )
 
@@ -405,26 +599,26 @@ async def send_image_by_media_id(to_phone: str, media_id: str, caption: Optional
 # Thin wrapper: translate collected fields to your goldflake function
 
 
-def call_goldflake(room_id: str, user_gender: str, scene: str,
-                   user_file_url: str, buddy_file_url: str) -> Optional[bytes]:
-    """
-    Calls your run_comfy_workflow_and_send_image_goldflake with the correct mapping.
-    Returns image bytes (if your function returns bytes). If it returns None, we log and return None.
-    """
-    # Use scene as both archetype and final_profile; adjust if your downstream expects other labels
-    try:
-        result = run_comfy_workflow_and_send_image_goldflake(
-            sender=room_id,
-            gender=(user_gender or "").lower(),
-            final_profile=scene,                  # used in s3_key(...) inside your function
-            person1_input_image=user_file_url,    # user (person1)
-            person2_input_image=buddy_file_url,   # buddy (person2)
-            archetype=scene                       # 'chai' or 'rooftop'
-        )
-        return result  # expected to be image bytes per your note
-    except Exception as e:
-        logger.exception(f"Goldflake run failed: {e}")
-        return None
+# def call_goldflake(room_id: str, user_gender: str, scene: str,
+#                    user_file_url: str, buddy_file_url: str) -> Optional[bytes]:
+#     """
+#     Calls your run_comfy_workflow_and_send_image_goldflake with the correct mapping.
+#     Returns image bytes (if your function returns bytes). If it returns None, we log and return None.
+#     """
+#     # Use scene as both archetype and final_profile; adjust if your downstream expects other labels
+#     try:
+#         result = run_comfy_workflow_and_send_image_goldflake(
+#             sender=room_id,
+#             gender=(user_gender or "").lower(),
+#             final_profile=scene,                  # used in s3_key(...) inside your function
+#             person1_input_image=user_file_url,    # user (person1)
+#             person2_input_image=buddy_file_url,   # buddy (person2)
+#             archetype=scene                       # 'chai' or 'rooftop'
+#         )
+#         return result  # expected to be image bytes per your note
+#     except Exception as e:
+#         logger.exception(f"Goldflake run failed: {e}")
+#         return None
 
 
 def _looks_http(s: str) -> bool:
@@ -679,42 +873,37 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     try:
         data = await request.json()  # parse incoming JSON body
     except Exception as e:
-        logger.error(f"Invalid JSON payload: {e}")  # log parse error
-        return {"status": "ignored"}                 # return benign response
+        logger.error(f"Invalid JSON payload: {e}")
+        return {"status": "ignored"}
 
     # ---- WhatsApp wraps messages under entry[].changes[].value.messages[] ----
-    entries = data.get("entry", [])                  # get entry array
-    if not entries:                                  # if no entries, nothing to do
+    entries = data.get("entry", []) or []
+    if not entries:
         logger.debug("No entries found in webhook payload.")
-        return {"status": "ok"}                      # acknowledge
+        return {"status": "ok"}
 
-    # ---- Iterate over entries and changes as per WA webhook schema ----
+    # ---- Iterate entries / changes ----
     for entry in entries:
-        for change in entry.get("changes", []):
-            value = change.get("value", {}) or {}    # extract change.value
-            messages = value.get("messages", []) or []  # list of messages; empty for status updates
-            if not messages:                         # skip if no actual inbound message
+        for change in entry.get("changes", []) or []:
+            value = change.get("value", {}) or {}
+            messages = value.get("messages", []) or []
+            if not messages:
                 continue
 
-            # ---- Process each inbound message ----
             for msg in messages:
-                from_phone = msg.get("from")         # sender phone id
-                if not from_phone:                   # ensure sender exists
+                from_phone = msg.get("from")
+                if not from_phone:
                     logger.warning("Message without 'from' field; skipping.")
                     continue
 
-                msg_type = msg.get("type")           # message type: interactive/text/image/etc
-                session = get_session(from_phone)    # get/create a per-sender session dict
-                logger.info(
-                    f"Incoming message from {from_phone} | Type: {msg_type} | Stage: {session['stage']}"
-                )
+                # Try to fetch the active session for this phone (do NOT auto-create here)
+                session = get_active_session(from_phone)
+                # For debugging: show whether we found one
+                logger.debug(f"[webhook] incoming from={from_phone} active_session_exists={bool(session)}")
 
-
-
-                # =========================
-                # BUTTON / INTERACTIVE REPLIES
-                # =========================
-
+                msg_type = msg.get("type")
+                # If we still don't have a session, create a minimal t_and_c session only when we need to
+                # (e.g. user sent greeting). For everything else, ask user to start.
                 choice_id = None
                 raw_text = None
                 lower = None
@@ -729,61 +918,107 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     raw_text = ((msg.get("text") or {}).get("body") or "")
                     lower = raw_text.strip().lower()
 
-                # --- GLOBAL RESTART: works from any stage ---
-                if choice_id == "restart_flow" or (lower in {"restart", "reset", "start over", "startover","hi"} if lower is not None else False):
-                    logger.info(f"[RESTART] by {from_phone} (prev stage={session.get('stage')}, status={session.get('status')})")
-                    reset_session(from_phone)
+                # === GLOBAL: quick restart via button / keywords ===
+                if choice_id == "restart_flow" or (lower in {"restart", "reset", "start over", "startover", "hi"} if lower is not None else False):
+                    logger.info(f"[RESTART] by {from_phone} (had_active={bool(session)})")
+                    # End any active session and start a fresh one
+                    try:
+                        await end_session(from_phone, reason="user_restart")
+                    except Exception:
+                        # ignore errors ending previous session
+                        pass
+                    session = await start_new_session(from_phone, initial_stage="t_and_c")
+                    # snapshot and send T&C
+                    background_tasks.add_task(save_session_snapshot, from_phone, session)
                     background_tasks.add_task(send_terms_and_conditions_question, from_phone)
-                    continue  # do not fall through
+                    continue
 
-                # --- DONE NUDGE: only after restart branch ---
+                # If there is no active session, only accept greetings/text that should start one,
+                # otherwise ask user to start explicitly.
+                if not session:
+                    if msg_type == "text" and lower in {"hi", "hello", "hey", "hii"}:
+                        # create new session at t_and_c and prompt T&C
+                        session = await start_new_session(from_phone, initial_stage="t_and_c")
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
+                        background_tasks.add_task(send_terms_and_conditions_question, from_phone)
+                        continue
+                    else:
+                        # Polite instruction — ask user to start
+                        background_tasks.add_task(send_text, from_phone, "To begin, reply *start* or say *hi*.")
+                        continue
+
+                # At this point we have an active session object
+                logger.info(f"Incoming message from {from_phone} | Type: {msg_type} | Stage: {session.get('stage')}")
+
+                # If session marked done -> nudge restart
                 if session.get("status") == "done":
                     background_tasks.add_task(send_text, from_phone, "This session is finished. Reply *restart* to begin again.")
                     background_tasks.add_task(send_restart_button, from_phone)
                     continue
 
-                # --- INTERACTIVE (stage-specific) ---
+                # =========================
+                # INTERACTIVE BUTTONS (stage-specific)
+                # =========================
                 if msg_type == "interactive" and choice_id:
                     st = session.get("stage")
 
                     if choice_id == "agree_yes":
+                        # Ensure we have an active session (should be) and move forward
                         session["stage"] = "q_scene"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_text, from_phone, "Great! ✅ Let’s begin.")
                         background_tasks.add_task(send_scene_question, from_phone)
                         continue
 
                     if choice_id == "agree_no":
                         session["stage"] = "t_and_c"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_text, from_phone, "No worries. You can come back anytime to accept and continue 👋")
                         continue
 
                     if st == "q_scene" and choice_id in {"scene_chai", "scene_rooftop"}:
                         session["scene"] = "chai" if choice_id == "scene_chai" else "chai_2"
                         session["stage"] = "q_name"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_name_question, from_phone)
                         continue
 
                     if st == "q_gender" and choice_id in {"gender_me_male", "gender_me_female"}:
                         session["gender"] = "male" if choice_id == "gender_me_male" else "female"
                         session["stage"] = "q_buddy_name"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_buddy_name_question, from_phone)
                         continue
 
                     if st == "q_buddy_gender" and choice_id in {"gender_buddy_male", "gender_buddy_female"}:
                         session["buddy_gender"] = "male" if choice_id == "gender_buddy_male" else "female"
                         session["stage"] = "q_user_image"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_text, from_phone, "Please send **your photo** now (as an image).")
                         continue
 
-                    # fallback for unexpected button
+                    # fallback for unexpected interactive button
                     background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
                     continue
 
-                # --- TEXT (stage-specific) ---
+                # =========================
+                # TEXT MESSAGES (stage-specific)
+                # =========================
                 if msg_type == "text" and lower is not None:
                     st = session.get("stage")
 
                     if st == "t_and_c" and lower in {"hi", "hello", "hey", "heyy", "hii"}:
+                        # If user texts greetings while in t_and_c we re-send T&C
                         background_tasks.add_task(send_terms_and_conditions_question, from_phone)
                         continue
 
@@ -791,6 +1026,9 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         if 1 <= len(raw_text.strip()) <= 60:
                             session["name"] = raw_text.strip()
                             session["stage"] = "q_gender"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
                             background_tasks.add_task(send_gender_question, from_phone)
                         else:
                             background_tasks.add_task(send_text, from_phone, "Please send a valid name (1–60 characters).")
@@ -800,12 +1038,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         if 1 <= len(raw_text.strip()) <= 60:
                             session["buddy_name"] = raw_text.strip()
                             session["stage"] = "q_buddy_gender"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
                             background_tasks.add_task(send_buddy_gender_question, from_phone)
                         else:
                             background_tasks.add_task(send_text, from_phone, "Please send a valid buddy name (1–60 characters).")
                         continue
 
-                    # generic re-prompts
+                    # generic re-prompts for text messages at wrong input
                     if st == "q_scene":
                         background_tasks.add_task(send_scene_question, from_phone)
                     elif st == "q_gender":
@@ -820,132 +1061,116 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
                     continue
 
-                # --- GLOBAL RESTART: button or keywords should work from ANY stage ---
-                if choice_id == "restart_flow" or (lower in {"restart", "reset", "start over", "startover"} if lower else False):
-                    logger.info(f"[RESTART] by {from_phone} (prev stage={session.get('stage')}, status={session.get('status')})")
-                    reset_session(from_phone)  # brand new session with stage=t_and_c, status=active
-                    background_tasks.add_task(send_terms_and_conditions_question, from_phone)
-                    continue  # DO NOT fall through
-
-                # --- DONE NUDGE: only after giving the restart branch a chance ---
-                if session.get("status") == "done":
-                    background_tasks.add_task(
-                        send_text,
-                        from_phone,
-                        "This session is finished. Reply *restart* to begin again."
-                    )
-                    background_tasks.add_task(send_restart_button, from_phone)
-                    continue
                 # =========================
-                # IMAGES (WhatsApp media)
+                # IMAGE (WhatsApp media)
                 # =========================
                 if msg_type == "image":
-                    image_obj = msg.get("image", {}) or {}                   # image object
-                    media_id = image_obj.get("id")                           # WhatsApp media_id
-                    if not media_id:                                         # ensure media id exists
+                    image_obj = msg.get("image", {}) or {}
+                    media_id = image_obj.get("id")
+                    if not media_id:
                         logger.warning(f"Image message without media id from {from_phone}")
                         continue
 
-                    logger.info(f"[IMAGE] from={from_phone} stage={session['stage']} media_id={media_id}")
+                    logger.info(f"[IMAGE] from={from_phone} stage={session.get('stage')} media_id={media_id}")
 
-                    # Ensure a room_id exists in session (used as grouping key in S3)
-                    if not session.get("room_id"):
-                        session["room_id"] = uuid.uuid4().hex                # 32-char hex id
-                        logger.info(f"Generated room_id for {from_phone}: {session['room_id']}")
-                    room_id = session["room_id"]                             # cache room id
+                    # We require an active session with a room_id. Do NOT create room_id here.
+                    room_id = session.get("room_id")
+                    if not room_id:
+                        # session should have been created at start; instruct user to restart flow
+                        logger.warning(f"No room_id in active session for {from_phone}; asking user to restart.")
+                        background_tasks.add_task(send_text, from_phone, "Please restart the flow by replying *restart* or type *hi* to begin.")
+                        background_tasks.add_task(send_restart_button, from_phone)
+                        continue
 
                     # ---------- Branch 1: Expecting USER image ----------
-                    if session["stage"] == "q_user_image":
-                        filename = f"{room_id}_p1.jpg"                       # local temp filename
+                    if session.get("stage") == "q_user_image":
+                        filename = f"{room_id}_p1.jpg"
                         try:
-                            abs_path = await download_whatsapp_media_to_file(media_id, filename)  # download from WA
+                            abs_path = await download_whatsapp_media_to_file(media_id, filename)
                         except Exception as e:
-                            logger.exception(f"Failed to download user image: {e}")               # log error
-                            background_tasks.add_task(
-                                send_text, from_phone, "Couldn’t read that image. Please resend."
-                            )
+                            logger.exception(f"Failed to download user image: {e}")
+                            background_tasks.add_task(send_text, from_phone, "Couldn’t read that image. Please resend.")
                             continue
 
-                        session["user_image_path"] = abs_path                # store local path for debug/tracking
-
-                        # Upload to S3 and store presigned URL for p1
+                        session["user_image_path"] = abs_path
                         try:
-                            key1 = s3_key_for_user_upload(room_id, "p1")     # s3 key: goldflake/user_uploads/{room_id}/p1.jpg
-                            upload_file_to_s3(session["user_image_path"], key1, cache_control="private, max-age=31536000")  # put object
-                            session["user_image_url"] = presign_get_url(key1, expires=3600)  # presigned HTTPS URL
+                            key1 = s3_key_for_user_upload(room_id, "p1")
+                            upload_file_to_s3(session["user_image_path"], key1, cache_control="private, max-age=31536000")
+                            session["user_image_url"] = presign_get_url(key1, expires=3600)
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
                             logger.info(f"[S3] Uploaded user image -> s3://{S3_GF_BUCKET}/{key1}")
                         except Exception as e:
-                            logger.exception(f"S3 upload/presign failed (user image): {e}")  # log S3 failure
-                            background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")  # inform user
+                            logger.exception(f"S3 upload/presign failed (user image): {e}")
+                            background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        # Move the flow to buddy image
-                        session["stage"] = "q_buddy_image"                   # expect buddy image next
-                        background_tasks.add_task(
-                            send_text, from_phone, "Got it. Now please send your **buddy’s photo** (as an image)."
-                        )
-                        continue  # next message
+                        # Move the flow to expect buddy image
+                        session["stage"] = "q_buddy_image"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
+                        background_tasks.add_task(send_text, from_phone, "Got it. Now please send your **buddy’s photo** (as an image).")
+                        continue
 
                     # ---------- Branch 2: Expecting BUDDY image ----------
-                    if session["stage"] == "q_buddy_image":
-                        filename = f"{room_id}_p2.jpg"                       # local temp filename
+                    if session.get("stage") == "q_buddy_image":
+                        filename = f"{room_id}_p2.jpg"
                         try:
-                            abs_path = await download_whatsapp_media_to_file(media_id, filename)  # download from WA
+                            abs_path = await download_whatsapp_media_to_file(media_id, filename)
                         except Exception as e:
-                            logger.exception(f"Failed to download buddy image: {e}")               # log error
-                            background_tasks.add_task(
-                                send_text, from_phone, "Couldn’t read that image. Please resend."
-                            )
+                            logger.exception(f"Failed to download buddy image: {e}")
+                            background_tasks.add_task(send_text, from_phone, "Couldn’t read that image. Please resend.")
                             continue
 
-                        session["buddy_image_path"] = abs_path               # store local path for debug/tracking
-
-                        # Upload buddy image to S3 and store presigned URL for p2
+                        session["buddy_image_path"] = abs_path
                         try:
-                            key2 = s3_key_for_user_upload(room_id, "p2")     # s3 key: goldflake/user_uploads/{room_id}/p2.jpg
-                            upload_file_to_s3(session["buddy_image_path"], key2, cache_control="private, max-age=31536000")  # put object
-                            session["buddy_image_url"] = presign_get_url(key2, expires=3600)  # presigned HTTPS URL
+                            key2 = s3_key_for_user_upload(room_id, "p2")
+                            upload_file_to_s3(session["buddy_image_path"], key2, cache_control="private, max-age=31536000")
+                            session["buddy_image_url"] = presign_get_url(key2, expires=3600)
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
                             logger.info(f"[S3] Uploaded buddy image -> s3://{S3_GF_BUCKET}/{key2}")
                         except Exception as e:
-                            logger.exception(f"S3 upload/presign failed (buddy image): {e}")   # log S3 failure
-                            background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")  # inform user
+                            logger.exception(f"S3 upload/presign failed (buddy image): {e}")
+                            background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        # Ensure required metadata exists before we dispatch generation
+                        # Validate required fields before generating
                         required_keys = ("scene", "gender", "buddy_gender", "user_image_url", "buddy_image_url")
-                        missing = [k for k in required_keys if not session.get(k)]  # compute missing fields
+                        missing = [k for k in required_keys if not session.get(k)]
                         if missing:
-                            logger.error(f"Missing fields before goldflake: {missing} for {from_phone}")  # log missing
-                            background_tasks.add_task(
-                                send_text,
-                                from_phone,
-                                "We’re missing some details. Let’s continue where we left off.",
-                            )
-                            # Jump user back to the correct question based on what's missing
+                            logger.error(f"Missing fields before goldflake generation: {missing} for {from_phone}")
+                            background_tasks.add_task(send_text, from_phone, "We’re missing some details. Let’s continue where we left off.")
+                            # guide user to provide missing fields
                             if not session.get("scene"):
-                                session["stage"] = "q_scene"; background_tasks.add_task(send_scene_question, from_phone)
+                                session["stage"] = "q_scene"
+                                background_tasks.add_task(send_scene_question, from_phone)
                             elif not session.get("gender"):
-                                session["stage"] = "q_gender"; background_tasks.add_task(send_gender_question, from_phone)
+                                session["stage"] = "q_gender"
+                                background_tasks.add_task(send_gender_question, from_phone)
                             elif not session.get("buddy_gender"):
-                                session["stage"] = "q_buddy_gender"; background_tasks.add_task(send_buddy_gender_question, from_phone)
+                                session["stage"] = "q_buddy_gender"
+                                background_tasks.add_task(send_buddy_gender_question, from_phone)
                             elif not session.get("user_image_url"):
-                                session["stage"] = "q_user_image"; background_tasks.add_task(
-                                    send_text, from_phone, "Please send your photo as an image."
-                                )
+                                session["stage"] = "q_user_image"
+                                background_tasks.add_task(send_text, from_phone, "Please send your photo as an image.")
                             else:
-                                session["stage"] = "q_buddy_image"; background_tasks.add_task(
-                                    send_text, from_phone, "Please send your buddy’s photo."
-                                )
-                            continue  # wait for user to provide missing info
+                                session["stage"] = "q_buddy_image"
+                                background_tasks.add_task(send_text, from_phone, "Please send your buddy’s photo.")
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
+                            continue
 
-                        # Build final inputs for generation — use HTTPS S3 URLs (NOT file://)
-                        p1_url = session["user_image_url"]                  # S3 presigned URL for user image
-                        p2_url = session["buddy_image_url"]                 # S3 presigned URL for buddy image
-                        scene = session["scene"]                            # archetype / scene
-                        user_gender = session["gender"]                     # person1_gender
-                        buddy_gender = session["buddy_gender"]              # person2_gender
+                        # Build final inputs
+                        p1_url = session["user_image_url"]
+                        p2_url = session["buddy_image_url"]
+                        scene = session["scene"]
+                        user_gender = session["gender"]
+                        buddy_gender = session["buddy_gender"]
 
-                        # Background task to call webhook_goldflake (which triggers ComfyUI)
+                        # Background worker — queue generation
                         async def _generate_and_send(from_phone: str,
                                                     room_id: str,
                                                     scene: str,
@@ -954,112 +1179,140 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                                     p1_url: str,
                                                     p2_url: str) -> None:
                             """
-                            - Tells user we're generating.
-                            - Computes the final S3 key up-front.
-                            - Runs the generator in a worker thread.
-                            - Polls S3 HEAD for the key to appear (upload finished).
-                            - Presigns the key and sends the image link to WhatsApp.
+                            Worker to run generator, poll S3, send final image and persist final session state.
+                            Important: schedule DB writes with asyncio.create_task(...) instead of awaiting them
+                                    to avoid 'Future attached to a different loop' errors.
                             """
                             try:
                                 await send_text(from_phone, "Awesome! Generating your image. This can take a bit…")
 
-                                # 🔸 1) deterministic key (caller controls it)
-                                upload_key = s3_key(room_id, scene)  # e.g., chat360/generated/<room_id>_<scene>_<ts>.jpg
+                                upload_key = s3_key(room_id, scene)
 
-                                # 🔸 2) compute gender folder expected by your generator
-                                g1 = user_gender.lower().strip()
-                                g2 = buddy_gender.lower().strip()
+                                g1 = (user_gender or "").lower().strip()
+                                g2 = (buddy_gender or "").lower().strip()
                                 if g1 == "female" and g2 == "male":
-                                    g1, g2 =g2, g1
+                                    g1, g2 = g2, g1
                                     p1_url, p2_url = p2_url, p1_url
-                                    combined_gender_folder = f"{g1}_{g2}"
-                                    print ("exchanged in generate_and_send")
-                                else:
-                                    combined_gender_folder = f"{g1}_{g2}"
+                                    logger.debug("Swapped p1/p2 because generator expects male_first ordering.")
+                                combined_gender_folder = f"{g1}_{g2}"
+
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(from_phone, "Invalid gender combination.")
                                     return
 
-                                # 🔸 3) run the heavy sync generator off the event loop
+                                # Run heavy sync work off the event loop
                                 result = await asyncio.to_thread(
-            _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key
-        )
+                                    _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key
+                                )
 
-                                # We DO NOT trust/need s3_url from result. We only check status and then S3.
                                 if not (isinstance(result, dict) and result.get("success")):
                                     err = (result or {}).get("error", "Unknown error")
                                     logger.error(f"[goldflake] generation failed: {err}")
                                     await send_text(from_phone, "Generation failed. Please try again later.")
                                     return
 
-                                # 🔸 4) poll S3 for existence of the key (complete upload)
-                                #     Try up to ~120s (adjust as you like)
+                                # Poll S3 for the result
                                 for _ in range(120):
                                     try:
                                         _s3.head_object(Bucket=S3_GF_BUCKET, Key=upload_key)
-                                        break  # found
+                                        break
                                     except Exception:
                                         await asyncio.sleep(1)
                                 else:
-                                    # never broke => not found within timeout
                                     logger.error(f"[goldflake] timed out waiting for S3 key: {upload_key}")
                                     await send_text(from_phone, "Upload is taking longer than expected. Please try again shortly.")
                                     return
 
-                                # 🔸 5) now it exists -> presign and send
+                                # Presign and send final image
                                 s3_url = presign_get_url(upload_key, expires=3600)
                                 await send_image_by_link(
                                     to_phone=from_phone,
                                     url=s3_url,
                                     caption=f"{scene.title()} | Tap to view",
                                 )
-                                # mark session stage elsewhere as 'done' if you keep that state machine
-                                
-                                end_session(from_phone, reason="completed_success")
+
+                                # --- Persist final image URL and mark session done ---
                                 try:
-                                    await send_text(
-                                        from_phone,
-                                        "✅ Done! If you want to start again, reply *restart* or tap the button below."
-                                    )
-                                    # optional: send a restart button
-                                    await send_restart_button(from_phone)
-                                except Exception:
-                                    pass
+                                    session = get_active_session(from_phone)
+                                    if session and session.get("room_id") == room_id:
+                                        session["final_image_url"] = s3_url
+                                        session["status"] = "done"
+                                        session["stage"] = "done"
+                                        session["updated_at_utc"] = now_utc_iso()
+                                        session["updated_at_ist"] = now_ist_iso()
+
+                                        # schedule snapshot write on the running loop (non-blocking)
+                                        try:
+                                            asyncio.create_task(save_session_snapshot(from_phone, session))
+                                        except Exception as e:
+                                            logger.exception(f"[snapshot] failed to schedule save_session_snapshot (active): {e}")
+                                    else:
+                                        snap = {
+                                            "room_id": room_id,
+                                            "wa_phone": from_phone,
+                                            "final_image_url": s3_url,
+                                            "status": "done",
+                                            "stage": "done",
+                                            "updated_at_utc": now_utc_iso(),
+                                            "updated_at_ist": now_ist_iso(),
+                                        }
+                                        try:
+                                            asyncio.create_task(save_session_snapshot(from_phone, snap))
+                                        except Exception as e:
+                                            logger.exception(f"[snapshot] failed to schedule save_session_snapshot (minimal): {e}")
+                                except Exception as e:
+                                    logger.exception(f"[goldflake] Exception while preparing final snapshot: {e}")
+
+                                # End the session (archive in-memory). await is OK here.
+                                try:
+                                    archived = await end_session(from_phone, reason="completed_success")
+                                    # persist archived session too (scheduled, non-blocking)
+                                    if archived:
+                                        archived["final_image_url"] = archived.get("final_image_url", s3_url)
+                                        archived["status"] = "done"
+                                        archived["stage"] = "done"
+                                        try:
+                                            asyncio.create_task(save_session_snapshot(from_phone, archived))
+                                        except Exception as e:
+                                            logger.exception(f"[snapshot] failed to schedule save_session_snapshot (archived): {e}")
+                                except Exception as e:
+                                    logger.exception(f"[goldflake] Failed to end session after generation: {e}")
+
                             except Exception as e:
                                 logger.exception(f"[goldflake] Failed to generate/send image: {e}")
                                 try:
                                     await send_text(from_phone, "Generation failed. Please try again later.")
                                 except Exception:
                                     pass
-                        # Queue generation in background; keep main webhook snappy
+
+                        # schedule the generation (non-blocking)
                         background_tasks.add_task(
-                    fire_and_forget,
-                    _generate_and_send(from_phone, room_id, scene, user_gender, buddy_gender, p1_url, p2_url)
-                )      # schedule async generation
-                        session["stage"] = "processing"                      # mark as processing
-                        continue  # move on to next message
+                            fire_and_forget,
+                            _generate_and_send(from_phone, room_id, scene, user_gender, buddy_gender, p1_url, p2_url)
+                        )
+
+                        session["stage"] = "processing"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
+                        continue
 
                     # ---------- Any other stage receiving an image ----------
-                    background_tasks.add_task(
-                        send_text, from_phone, "We’re expecting a different input. Let’s continue."
-                    )
-                    if session["stage"] == "q_user_image":
+                    background_tasks.add_task(send_text, from_phone, "We’re expecting a different input. Let’s continue.")
+                    if session.get("stage") == "q_user_image":
                         background_tasks.add_task(send_text, from_phone, "Please send **your photo** as an image.")
-                    elif session["stage"] == "q_buddy_image":
+                    elif session.get("stage") == "q_buddy_image":
                         background_tasks.add_task(send_text, from_phone, "Please send your **buddy’s photo** as an image.")
-                    continue  # next message
+                    continue
 
                 # =========================
                 # OTHER MESSAGE TYPES → ignore politely
                 # =========================
-                logger.info(
-                    f"Ignoring non-text, non-interactive, non-image message at stage {session['stage']} from {from_phone}"
-                )
+                logger.info(f"Ignoring non-text/non-interactive/non-image message at stage {session.get('stage')} from {from_phone}")
 
-    # ---- Finish request quickly; background tasks will keep running ----
+    # Finish quickly; background tasks do the heavy lifting
     logger.info("Webhook processing complete.")
     return {"status": "ok"}
-
 
 # --- Buttons: Scene selection (chai / rooftop) ---
 async def send_scene_question(to_phone: str):
