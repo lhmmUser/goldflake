@@ -340,10 +340,14 @@ async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
     # archetype/scene
     archetype = (session.get("scene") or None)
 
+    # brand info (may be absent until user answers)
+    brand_name = session.get("brand") or None       # e.g. "Gold Flake"
+    brand_id = session.get("brand_id") or None      # e.g. "brand_goldflake" (optional)
+
     # combined gender if both known
     combined = _combined_gender(p1_gender, p2_gender)
 
-     # final image url & status (may be absent until generation completes)
+    # final image url & status (may be absent until generation completes)
     final_image = session.get("final_image_url") or session.get("final_image")
     status = session.get("status") or None
     end_reason = session.get("end_reason") or None
@@ -364,7 +368,9 @@ async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
         "person2_gender": p2_gender,
         "person1_selfie": p1_selfie,  # can be presigned URL or local path (early stages)
         "person2_selfie": p2_selfie,
-        "archetype": archetype,       # 'chai' or 'chai_2' as you set today
+        "archetype": archetype,       # 'chai' or 'rooftop' as you set
+        "brand": brand_name,          # human-friendly brand name (if answered)
+        "brand_id": brand_id,         # optional choice id (if you store it on session)
         "combined_gender": combined,  # male_male | male_female | female_female | None
         "stage": session.get("stage"),
         # final image + status fields (only None if not set)
@@ -378,7 +384,6 @@ async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
         "time_req_recieved_ist": session.get("time_req_recieved_ist") or now_ist.isoformat(),
         "updated_at_utc": now_utc,
         "updated_at_ist": now_ist.isoformat(),
-
     }
 
     # set-on-insert once; update the rest each snapshot
@@ -393,7 +398,9 @@ async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
             {"$set": doc_set, "$setOnInsert": soi},
             upsert=True,
         )
-        logger.debug(f"[snapshot] upserted room_id={room_id} status={status} final_image={'YES' if final_image else 'NO'}")
+        logger.debug(
+            f"[snapshot] upserted room_id={room_id} status={status} final_image={'YES' if final_image else 'NO'} brand={brand_name or 'NONE'}"
+        )
     except Exception as e:
         logger.exception(f"[snapshot] upsert failed for room_id={room_id}: {e}")
 
@@ -596,30 +603,6 @@ async def send_image_by_media_id(to_phone: str, media_id: str, caption: Optional
             raise RuntimeError(f"Send image failed: {resp.text}")
         logger.info(f"Sent image to {to_phone} media_id={media_id}")
 
-# Thin wrapper: translate collected fields to your goldflake function
-
-
-# def call_goldflake(room_id: str, user_gender: str, scene: str,
-#                    user_file_url: str, buddy_file_url: str) -> Optional[bytes]:
-#     """
-#     Calls your run_comfy_workflow_and_send_image_goldflake with the correct mapping.
-#     Returns image bytes (if your function returns bytes). If it returns None, we log and return None.
-#     """
-#     # Use scene as both archetype and final_profile; adjust if your downstream expects other labels
-#     try:
-#         result = run_comfy_workflow_and_send_image_goldflake(
-#             sender=room_id,
-#             gender=(user_gender or "").lower(),
-#             final_profile=scene,                  # used in s3_key(...) inside your function
-#             person1_input_image=user_file_url,    # user (person1)
-#             person2_input_image=buddy_file_url,   # buddy (person2)
-#             archetype=scene                       # 'chai' or 'rooftop'
-#         )
-#         return result  # expected to be image bytes per your note
-#     except Exception as e:
-#         logger.exception(f"Goldflake run failed: {e}")
-#         return None
-
 
 def _looks_http(s: str) -> bool:
     s = (s or "").lower()
@@ -648,7 +631,8 @@ def _run(room_id: str,
                 scene: str,
                 p1_url: str,
                 p2_url: str,
-                upload_key: str) -> dict:
+                upload_key: str,
+                archetype_for_comfy: str) -> dict:
             """
             Runs the generator synchronously (in a worker thread) using a deterministic upload_key.
             Returns the dict from run_comfy_workflow_and_send_image_goldflake.
@@ -660,7 +644,7 @@ def _run(room_id: str,
                     final_profile=scene,               # "chai" or "rooftop"
                     person1_input_image=p1_url,
                     person2_input_image=p2_url,
-                    archetype=scene,
+                    archetype=archetype_for_comfy,   # e.g., "chai" or "rooftop"
                     upload_key=upload_key,             # 🔸 deterministic key chosen by caller
                 )
             except Exception as e:
@@ -676,15 +660,7 @@ async def webhook_goldflake(
     person2_selfie: str,
     tasks: Optional[BackgroundTasks] = None,   # optional; if provided we schedule, else run inline
 ) -> Dict[str, Any]:
-    """
-    Validates inputs, normalizes genders/images, records the request,
-    and dispatches the ComfyUI workflow via run_comfy_workflow_and_send_image_goldflake.
-
-    Behavior:
-      - If person*_selfie are already http(s) (e.g., S3 presigned URLs), pass through.
-      - Else (e.g., WA media_id) -> download locally, upload to S3, presign, pass the URLs.
-    """
-    # --- small helpers (local to keep your module clean) ---
+    
     def _looks_http(s: str) -> bool:
         s = (s or "").lower().strip()
         return s.startswith("http://") or s.startswith("https://")
@@ -814,7 +790,8 @@ async def webhook_goldflake(
                 scene: str,
                 p1_url: str,
                 p2_url: str,
-                upload_key: str) -> dict:
+                upload_key: str,
+                archetype_for_comfy: str) -> dict:
             """
             Runs the generator synchronously (in a worker thread) using a deterministic upload_key.
             Returns the dict from run_comfy_workflow_and_send_image_goldflake.
@@ -826,7 +803,7 @@ async def webhook_goldflake(
                     final_profile=scene,               # "chai" or "rooftop"
                     person1_input_image=p1_url,
                     person2_input_image=p2_url,
-                    archetype=scene,
+                    archetype=archetype_for_comfy,
                     upload_key=upload_key,             # 🔸 deterministic key chosen by caller
                 )
             except Exception as e:
@@ -837,6 +814,8 @@ async def webhook_goldflake(
             tasks.add_task(_run)                                              # schedule background
             logger.info(f"[goldflake] queued run for room_id={room_id} archetype={archetype_norm}")
         else:
+            logger.info(f"[goldflake] calling _run with archetype={archetype_combined} upload_key={upload_key}")
+
             _run()                                                            # run inline
             logger.info(f"[goldflake] ran immediately for room_id={room_id} archetype={archetype_norm}")
 
@@ -910,9 +889,20 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                 if msg_type == "interactive":
                     interactive = (msg.get("interactive") or {})
+
+                    # button_reply is for "buttons"; list_reply is for "list" (options)
                     btn = interactive.get("button_reply")
+                    lst = interactive.get("list_reply")
+
                     if btn:
                         choice_id = btn.get("id")
+                        logger.debug(f"Button reply received from {from_phone}: id={choice_id}")
+                    elif lst:
+                        # list_reply generally contains 'id' and 'title'
+                        choice_id = lst.get("id")
+                        list_title = lst.get("title")  # optional: useful for logging/debug
+                        logger.debug(f"List reply received from {from_phone}: id={choice_id} title={list_title}")
+
 
                 elif msg_type == "text":
                     raw_text = ((msg.get("text") or {}).get("body") or "")
@@ -982,12 +972,43 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     if st == "q_scene" and choice_id in {"scene_chai", "scene_rooftop"}:
                         session["scene"] = "chai" if choice_id == "scene_chai" else "chai_2"
+                        session["stage"] = "q_brand"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
+                        background_tasks.add_task(send_brand_question, from_phone)
+                        continue
+
+                    # replace your existing q_brand handler with this
+                    if st == "q_brand" and choice_id in {
+                        "brand_goldflake", "brand_classic", "brand_wills", "brand_flake"
+                    }:
+                        # map the full choice id -> (brand_id, human_label)
+                        brand_map = {
+                            "brand_goldflake": ("goldflake", "Gold Flake"),
+                            "brand_classic":   ("classic",  "Classic"),
+                            "brand_wills":     ("wills",    "Wills"),
+                            "brand_flake":     ("flake",    "Flake"),
+                        }
+
+                        brand_pair = brand_map.get(choice_id)
+                        if not brand_pair:
+                            logger.error(f"Unknown brand choice_id: {choice_id}")
+                            background_tasks.add_task(send_text, from_phone, "Sorry, I didn't understand that selection. Please choose again.")
+                            background_tasks.add_task(send_brand_question, from_phone)
+                            continue
+
+                        brand_id, brand_label = brand_pair
+                        session["brand_id"] = brand_id         # stable id you can persist/compare
+                        session["brand"] = brand_label         # human-friendly label for UI/emails
                         session["stage"] = "q_name"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
                         background_tasks.add_task(send_name_question, from_phone)
                         continue
+
+
 
                     if st == "q_gender" and choice_id in {"gender_me_male", "gender_me_female"}:
                         session["gender"] = "male" if choice_id == "gender_me_male" else "female"
@@ -1049,6 +1070,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     # generic re-prompts for text messages at wrong input
                     if st == "q_scene":
                         background_tasks.add_task(send_scene_question, from_phone)
+                    elif st == "q_brand":
+                        background_tasks.add_task(send_brand_question, from_phone)
                     elif st == "q_gender":
                         background_tasks.add_task(send_gender_question, from_phone)
                     elif st == "q_user_image":
@@ -1139,7 +1162,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             continue
 
                         # Validate required fields before generating
-                        required_keys = ("scene", "gender", "buddy_gender", "user_image_url", "buddy_image_url")
+                        required_keys = ("scene", "brand_id", "gender", "buddy_gender", "user_image_url", "buddy_image_url")
                         missing = [k for k in required_keys if not session.get(k)]
                         if missing:
                             logger.error(f"Missing fields before goldflake generation: {missing} for {from_phone}")
@@ -1169,20 +1192,39 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         scene = session["scene"]
                         user_gender = session["gender"]
                         buddy_gender = session["buddy_gender"]
+                        brand_id = session.get("brand_id")  # <- FIX: use .get, not calling the dict
+
+                        # Defensive: ensure brand_id exists (you already have a guard earlier, but keep safe)
+                        if not brand_id:
+                            logger.error(f"Missing brand_id in session for {from_phone} before generation. Session: {session}")
+                            await send_text(from_phone, "We didn't record your brand selection. Please choose your brand again.")
+                            background_tasks.add_task(send_brand_question, from_phone)
+                            session["stage"] = "q_brand"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
+                            continue
+
+                        brand_id_safe = (brand_id or "").strip().lower()  # <- FIX: call lower()
+                        archetype_combined = f"{scene}_{brand_id_safe}"
+
 
                         # Background worker — queue generation
                         async def _generate_and_send(from_phone: str,
                                                     room_id: str,
                                                     scene: str,
+                                                    brand_id: str,
                                                     user_gender: str,
                                                     buddy_gender: str,
                                                     p1_url: str,
-                                                    p2_url: str) -> None:
+                                                    p2_url: str,
+                                                    archetype_combined: str) -> None:
                             """
                             Worker to run generator, poll S3, send final image and persist final session state.
                             Important: schedule DB writes with asyncio.create_task(...) instead of awaiting them
                                     to avoid 'Future attached to a different loop' errors.
                             """
+                            
                             try:
                                 await send_text(from_phone, "Awesome! Generating your image. This can take a bit…")
 
@@ -1199,10 +1241,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(from_phone, "Invalid gender combination.")
                                     return
-
+                                logger.info(f"[goldflake] archetype_combined={archetype_combined} upload_key={upload_key}")
+                                brand_id_safe = (brand_id or "").strip().lower()
+                                
+                                
+                                
+                                logger.info(f"[goldflake] starting generation for room_id={room_id} archetype={archetype_combined}")
                                 # Run heavy sync work off the event loop
                                 result = await asyncio.to_thread(
-                                    _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key
+                                    _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key, archetype_combined
                                 )
 
                                 if not (isinstance(result, dict) and result.get("success")):
@@ -1288,7 +1335,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         # schedule the generation (non-blocking)
                         background_tasks.add_task(
                             fire_and_forget,
-                            _generate_and_send(from_phone, room_id, scene, user_gender, buddy_gender, p1_url, p2_url)
+                            _generate_and_send(from_phone, room_id, scene,brand_id, user_gender, buddy_gender, p1_url, p2_url, archetype_combined)
                         )
 
                         session["stage"] = "processing"
@@ -1322,23 +1369,85 @@ async def send_scene_question(to_phone: str):
         "to": to_phone,
         "type": "interactive",
         "interactive": {
-            "type": "button",
-            "body": {"text": "Which scene captures your perfect smoke-buddy chill?"},
+            "type": "list",
+            "body": {
+                "text": "Which scene captures your perfect smoke-buddy chill?"
+            },
             "action": {
-                "buttons": [
-                    {"type": "reply", "reply": {"id": "scene_chai", "title": "Chai"}},
-                    {"type": "reply", "reply": {"id": "scene_rooftop", "title": "Rooftop"}},
-                ]
+                "button": "Choose Scene",
+                "sections": [
+                    {
+                        "title": "Scenes",
+                        "rows": [
+                            {
+                                "id": "scene_chai",
+                                "title": "Chai",
+                                "description": "Relaxing with chai and conversations"
+                            },
+                            {
+                                "id": "scene_rooftop",
+                                "title": "Rooftop",
+                                "description": "Breezy rooftop chill with music"
+                            },
+                        ],
+                    }
+                ],
             },
         },
     }
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code // 100 != 2:
             logger.error(f"Failed to send scene question to {to_phone}: {resp.text}")
         else:
             logger.info(f"Scene question sent to {to_phone}")
+
+async def send_brand_question(to_phone: str):
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {
+                "text": "Select your first smoke brand?"
+            },
+            "action": {
+                "button": "Choose Brand",
+                "sections": [
+                    {
+                        "title": "Brands",
+                        "rows": [
+                            {"id": "brand_goldflake", "title": "Gold Flake"},
+                            {"id": "brand_classic", "title": "Classic"},
+                            {"id": "brand_wills", "title": "Wills"},
+                            {"id": "brand_flake", "title": "Flake"},
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code // 100 != 2:
+            logger.error(f"Failed to send brand question to {to_phone}: {resp.text}")
+        else:
+            logger.info(f"Brand question sent to {to_phone}")
+
 
 # --- Ask for name (plain text) ---
 async def send_name_question(to_phone: str):
