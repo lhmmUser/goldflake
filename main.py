@@ -459,7 +459,7 @@ async def send_text(to_phone: str, text: str):
             logger.info(f"Sent text to {to_phone}: {text}")
 
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", r"D:\kush\goldflake-main\user_uploads")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", r"C:\Users\Haripriya\goldflake-main\user_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def _safe_name(name: str) -> str:
@@ -814,7 +814,7 @@ async def webhook_goldflake(
             tasks.add_task(_run)                                              # schedule background
             logger.info(f"[goldflake] queued run for room_id={room_id} archetype={archetype_norm}")
         else:
-            logger.info(f"[goldflake] calling _run with archetype={archetype_combined} upload_key={upload_key}")
+            # logger.info(f"[goldflake] calling _run with archetype={archetype_combined} upload_key={upload_key}")
 
             _run()                                                            # run inline
             logger.info(f"[goldflake] ran immediately for room_id={room_id} archetype={archetype_norm}")
@@ -1021,12 +1021,27 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     if st == "q_buddy_gender" and choice_id in {"gender_buddy_male", "gender_buddy_female"}:
                         session["buddy_gender"] = "male" if choice_id == "gender_buddy_male" else "female"
-                        session["stage"] = "q_user_image"
+                        session["stage"] = "q_buddy_number"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
-                        background_tasks.add_task(send_text, from_phone, "Please send **your photo** now (as an image).")
+                        background_tasks.add_task(send_buddy_number_question, from_phone)
                         continue
+
+                    if st == "q_buddy_number":
+                        digits = re.sub(r"\D", "", raw_text)
+                        if len(digits) == 10:
+                            session["buddy_number"] = digits
+                            session["stage"] = "q_user_image"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
+                            background_tasks.add_task(send_text, from_phone, "Great. Please send **your photo** now (as an image).")
+                        else:
+                            background_tasks.add_task(send_text, from_phone, "Please enter a valid 10-digit mobile number.")
+                        continue
+
+
 
                     # fallback for unexpected interactive button
                     background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
@@ -1066,6 +1081,69 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         else:
                             background_tasks.add_task(send_text, from_phone, "Please send a valid buddy name (1–60 characters).")
                         continue
+
+                    if st == "q_buddy_number":
+                        digits = re.sub(r"\D", "", raw_text)
+                        if len(digits) == 10:
+                            session["buddy_number"] = digits
+
+                            # advance user flow
+                            session["stage"] = "q_user_image"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
+                            background_tasks.add_task(send_text, from_phone, "Great. Please send **your photo** now (as an image).")
+
+                            # Compose full whatsapp number (try to reuse sender prefix)
+                            try:
+                                from_digits = re.sub(r"\D", "", from_phone or "")
+                                if len(from_digits) > 10:
+                                    prefix = from_digits[:-10]
+                                    buddy_whatsapp = prefix + digits
+                                else:
+                                    buddy_whatsapp = digits
+                            except Exception:
+                                buddy_whatsapp = digits
+
+                            # LOG the number we will notify (very important to debug)
+                            logger.info(f"[buddy_notify] computed buddy_whatsapp='{buddy_whatsapp}' invited_by='{from_phone}'")
+
+                            # Background worker: send hello and create session for buddy
+                            async def _notify_and_start_buddy(buddy_phone: str, inviter_name: str | None):
+                                # Only send the approved template to the buddy — nothing else.
+                                logger.info(f"[buddy_notify] task starting for {buddy_phone}")
+                                try:
+                                    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+                                    payload = {
+                                        "messaging_product": "whatsapp",
+                                        "to": buddy_phone,
+                                        "type": "template",
+                                        "template": {
+                                            "name": "hello_world",          # exact template name
+                                            "language": {"code": "en_US"}   # language code used when template created
+                                        }
+                                    }
+                                    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+                                    async with httpx.AsyncClient(timeout=20) as client:
+                                        resp = await client.post(url, headers=headers, json=payload)
+                                        body_preview = resp.text if len(resp.text) < 1000 else (resp.text[:1000] + "...")
+                                        if resp.status_code // 100 == 2:
+                                            logger.info(f"[buddy_notify] template send OK -> {resp.status_code} {body_preview}")
+                                        else:
+                                            logger.error(f"[buddy_notify] template send FAILED -> {resp.status_code} {body_preview}")
+                                except Exception as e:
+                                    logger.exception(f"[buddy_notify] template http send exception for {buddy_phone}: {e}")
+
+                                # Intentionally do NOT create sessions or send T&C here — per your request.
+
+                            # Schedule the background task directly (avoid wrapper that might swallow errors)
+                            background_tasks.add_task(_notify_and_start_buddy, buddy_whatsapp, session.get("name"))
+
+                        else:
+                            background_tasks.add_task(send_text, from_phone, "Please enter a valid 10-digit mobile number (digits only).")
+                        continue
+
+
 
                     # generic re-prompts for text messages at wrong input
                     if st == "q_scene":
@@ -1162,7 +1240,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             continue
 
                         # Validate required fields before generating
-                        required_keys = ("scene", "brand_id", "gender", "buddy_gender", "user_image_url", "buddy_image_url")
+                        required_keys = ("scene", "brand_id", "gender", "buddy_gender", "buddy_number", "user_image_url", "buddy_image_url")
                         missing = [k for k in required_keys if not session.get(k)]
                         if missing:
                             logger.error(f"Missing fields before goldflake generation: {missing} for {from_phone}")
@@ -1483,6 +1561,12 @@ async def send_gender_question(to_phone: str):
 async def send_buddy_name_question(to_phone: str):
     await send_text(to_phone, "Your smoke buddy’s name? (Reply with text)")
 
+async def send_buddy_number_question(to_phone: str):
+    await send_text(
+        to_phone,
+        "Please share your buddy’s 10-digit mobile number."
+    )
+
 # --- Buttons: Buddy gender (male / female) ---
 async def send_buddy_gender_question(to_phone: str):
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
@@ -1524,5 +1608,7 @@ async def re_prompt_for_stage(session: Dict[str, Any], to_phone: str, background
         background_tasks.add_task(send_buddy_name_question, to_phone)
     elif stage == "q_buddy_gender":
         background_tasks.add_task(send_buddy_gender_question, to_phone)
+    elif stage == "q_buddy_number":
+        background_tasks.add_task(send_buddy_number_question, to_phone)
     else:
         background_tasks.add_task(send_text, to_phone, "Let’s continue. Please follow the prompts.")
