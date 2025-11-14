@@ -951,7 +951,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                 # =========================
                 # We create buddy sessions with initial_stage == "q_buddy_image_only" and with metadata:
                 # session["linked_user_phone"], session["linked_user_room"]
-                if session.get("stage") == "q_buddy_image_only":
+                # =========================
+                # BUDDY-ONLY SESSION: handle buddy's flow first (if this session is a buddy session)
+                # =========================
+                # Buddy stages: q_buddy_wait_agree, q_buddy_image_only
+                # The buddy session should have been created with initial_stage="q_buddy_wait_agree"
+                st = session.get("stage")
+
+                # ---------- Branch: buddy image upload (final buddy stage) ----------
+                if st == "q_buddy_image_only":
                     # Buddy's job is simple: send an image. If they text, nudge them to send an image.
                     if msg_type == "image":
                         image_obj = msg.get("image", {}) or {}
@@ -961,11 +969,10 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(send_text, from_phone, "Please send your photo as an *image*.")
                             continue
 
-                        logger.info(f"[BUDDY-IMAGE] from={from_phone} stage={session.get('stage')} media_id={media_id}")
+                        logger.info(f"[BUDDY-IMAGE] from={from_phone} stage={st} media_id={media_id}")
 
                         # Save buddy image locally
                         linked_user_room = session.get("linked_user_room")
-                        # Use linked_user_room if available; else fallback to buddy's own room
                         room_id_for_upload = linked_user_room or session.get("room_id") or f"buddy_{from_phone}"
                         filename = f"{room_id_for_upload}_p2.jpg"
                         try:
@@ -996,31 +1003,24 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         linked_room = session.get("linked_user_room") or room_id_for_upload
 
                         if not linked_user_phone:
-                            # We don't know who requested this; notify buddy and stop
                             logger.error(f"No linked_user_phone for buddy session {from_phone}")
                             background_tasks.add_task(send_text, from_phone, "Thanks — we received your photo. We will notify the requester.")
                             continue
 
-                        # Retrieve user's active session (the requester)
                         user_session = get_active_session(linked_user_phone)
-                        # If user session missing, try to proceed using linked_room and stored user image snapshot
                         user_image_url = None
                         if user_session:
                             user_image_url = user_session.get("user_image_url")
                         else:
-                            # attempt to recover via snapshot lookup: your save_session_snapshot may persist; if you have a helper to fetch, use it.
-                            # For now we log and ask buddy to wait.
                             logger.error(f"Linked user session not active for {linked_user_phone}; can't complete generation yet.")
                             background_tasks.add_task(send_text, from_phone, "Thanks — we received your photo. We'll generate the image once the requester uploads theirs.")
                             continue
 
-                        # If user hasn't uploaded yet, inform buddy to wait
                         if not user_image_url:
                             background_tasks.add_task(send_text, from_phone, "We have your photo. The requester hasn't uploaded their photo yet. We'll start generation when both photos are available.")
                             continue
 
                         # At this point both user_image_url and buddy_image_url exist -> queue generation
-                        # Use the user's room id for final asset naming
                         room_id = linked_room or user_session.get("room_id")
                         if not room_id:
                             logger.error(f"No room_id available for generation. user_session={user_session}")
@@ -1043,16 +1043,24 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             continue
 
                         archetype_combined = f"{scene}_{(brand_id or '').strip().lower()}"
-
                         # Background worker — same generation worker you already have, run it for the requester
                         async def _generate_and_send_for_user():
+                            """
+                            Buddy-flow generation worker. Uses closure variables from outer scope:
+                            linked_user_phone, room_id, scene, p1_url, p2_url, user_gender, buddy_gender, archetype_combined, etc.
+                            `from_phone` in the outer scope is the buddy's phone (uploader).
+                            This worker sends final image to both requester and buddy.
+                            """
                             try:
+                                # capture buddy phone from outer scope
+                                buddy_phone = from_phone  # from_phone is the buddy who uploaded the image
                                 await send_text(linked_user_phone, "Awesome! Generating your image. This can take a bit…")
 
                                 upload_key = s3_key(room_id, scene)
 
                                 g1 = (user_gender or "").lower().strip()
                                 g2 = (buddy_gender or "").lower().strip()
+
                                 # swap if needed to match generator expectation
                                 if g1 == "female" and g2 == "male":
                                     g1, g2 = g2, g1
@@ -1061,6 +1069,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 else:
                                     p1 = p1_url
                                     p2 = p2_url
+
                                 combined_gender_folder = f"{g1}_{g2}"
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(linked_user_phone, "Invalid gender combination.")
@@ -1090,11 +1099,28 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     return
 
                                 s3_url = presign_get_url(upload_key, expires=3600)
+
+                                # send to requester
                                 await send_image_by_link(
                                     to_phone=linked_user_phone,
                                     url=s3_url,
                                     caption=f"{scene.title()} | Tap to view",
                                 )
+
+                                # --- NEW: also send to buddy (the uploader) ---
+                                try:
+                                    if buddy_phone:
+                                        logger.info(f"[goldflake] also sending final image to buddy {buddy_phone} (triggered generation for {linked_user_phone})")
+                                        try:
+                                            await send_image_by_link(
+                                                to_phone=buddy_phone,
+                                                url=s3_url,
+                                                caption=f"{scene.title()} — here’s the avatar you contributed to. Tap to view",
+                                            )
+                                        except Exception as e:
+                                            logger.exception(f"[goldflake] failed to send final image to buddy {buddy_phone}: {e}")
+                                except Exception as e:
+                                    logger.exception(f"[goldflake] unexpected error while attempting buddy send: {e}")
 
                                 # persist final state into requester's session
                                 try:
@@ -1146,6 +1172,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 except Exception:
                                     pass
 
+
                         background_tasks.add_task(fire_and_forget, _generate_and_send_for_user())
                         # done processing buddy image
                         continue
@@ -1153,6 +1180,21 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         # any non-image: nudge buddy to send an image
                         background_tasks.add_task(send_text, from_phone, "Hi — please send your photo as an *image* so we can complete the avatar.")
+                        continue
+                
+                # ---------- Branch: buddy must 'I agree' before image ----------
+                if st == "q_buddy_wait_agree":
+                    # if buddy sends exact agreed text -> advance to image-only stage
+                    if msg_type == "text" and lower == "i agree":
+                        session["stage"] = "q_buddy_image_only"
+                        session["updated_at_utc"] = now_utc_iso()
+                        session["updated_at_ist"] = now_ist_iso()
+                        background_tasks.add_task(save_session_snapshot, from_phone, session)
+                        background_tasks.add_task(send_text, from_phone, "Thanks — please send your photo now (as an image).")
+                        logger.info(f"[buddy_notify] buddy {from_phone} agreed; now awaiting image (linked to {session.get('linked_user_phone')}).")
+                        continue
+                    else:
+                        background_tasks.add_task(send_text, from_phone, "To continue, please reply exactly: *I agree*")
                         continue
 
                 # =========================
@@ -1230,7 +1272,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_buddy_number_question, from_phone)
                         continue
 
-                    # fallback for unexpected interactive button
                     background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
                     continue
 
@@ -1284,7 +1325,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             except Exception:
                                 buddy_whatsapp = digits
 
-                            # persist buddy_whatsapp for reference
                             session["buddy_whatsapp"] = buddy_whatsapp
 
                             # advance user flow to expect user's image only
@@ -1294,7 +1334,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(save_session_snapshot, from_phone, session)
                             background_tasks.add_task(send_text, from_phone, "Great. Please send **your photo** now (as an image).")
 
-                            # LOG and schedule notifying buddy (template) + create buddy session linked to this user
                             logger.info(f"[buddy_notify] computed buddy_whatsapp='{buddy_whatsapp}' invited_by='{from_phone}'")
 
                             async def _notify_and_start_buddy(buddy_phone: str, inviter_name: str | None, linked_user_phone: str, linked_room_id: str):
@@ -1323,11 +1362,9 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                                 # Create buddy session that is linked to the requester (user)
                                 try:
-                                    buddy_session = await start_new_session(buddy_phone, initial_stage="q_buddy_image_only")
-                                    # Save linkage so buddy session knows which user's room to use
+                                    buddy_session = await start_new_session(buddy_phone, initial_stage="q_buddy_wait_agree")
                                     buddy_session["linked_user_phone"] = linked_user_phone
                                     buddy_session["linked_user_room"] = linked_room_id
-                                    # persist snapshot
                                     try:
                                         await save_session_snapshot(buddy_phone, buddy_session)
                                     except Exception:
@@ -1335,7 +1372,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     logger.info(f"[buddy_notify] buddy session created for {buddy_phone} linked_to={linked_user_phone}/{linked_room_id}")
                                 except Exception as e:
                                     logger.exception(f"[buddy_notify] failed to create buddy session for {buddy_phone}: {e}")
-
                             # schedule notification + buddy session creation (non-blocking)
                             background_tasks.add_task(
                                 _notify_and_start_buddy,
@@ -1348,6 +1384,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         else:
                             background_tasks.add_task(send_text, from_phone, "Please enter a valid 10-digit mobile number (digits only).")
                         continue
+                    
+                    
 
                     # generic re-prompts for text messages at wrong input
                     if st == "q_scene":
@@ -1359,7 +1397,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     elif st == "q_user_image":
                         background_tasks.add_task(send_text, from_phone, "Please send your photo as an *image*.")
                     elif st == "q_buddy_image":
-                        # legacy: we no longer request buddy image from requester; inform user
                         background_tasks.add_task(send_text, from_phone, "We no longer ask you to upload your buddy's image. Your buddy will be invited to send theirs directly.")
                     elif st == "waiting_for_buddy_image":
                         background_tasks.add_task(send_text, from_phone, "We’re waiting for your buddy’s photo. They should receive an invite to send it.")
@@ -1382,7 +1419,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     logger.info(f"[IMAGE] from={from_phone} stage={session.get('stage')} media_id={media_id}")
 
-                    # We require an active session with a room_id. Do NOT create room_id here.
                     room_id = session.get("room_id")
                     if not room_id:
                         logger.warning(f"No room_id in active session for {from_phone}; asking user to restart.")
@@ -1390,7 +1426,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_restart_button, from_phone)
                         continue
 
-                    # ---------- Branch: Expecting USER image ----------
                     if session.get("stage") == "q_user_image":
                         filename = f"{room_id}_p1.jpg"
                         try:
@@ -1414,21 +1449,17 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        # Move the user flow into a waiting state for buddy image (user does NOT upload buddy image)
                         session["stage"] = "waiting_for_buddy_image"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
 
-                        # Let the user know buddy was invited and we will proceed when we have both images
                         background_tasks.add_task(send_text, from_phone,
                                                  "Got your photo. We invited your buddy to upload their photo — we'll start generating once they send it.")
                         continue
 
-                    # ---------- Branch: Legacy/existing BUDDY image stage (if present) ----------
-                    # Keep support but prefer buddy-only sessions: if a requester somehow is at q_buddy_image, accept it.
+                    # legacy branch: requester uploading buddy image (backwards compatibility)
                     if session.get("stage") == "q_buddy_image":
-                        # This branch retains backward compatibility if you still expect buddy image from user (optional).
                         filename = f"{room_id}_p2.jpg"
                         try:
                             abs_path = await download_whatsapp_media_to_file(media_id, filename)
@@ -1451,7 +1482,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        # Validate and trigger generation as before (this is the same generation branch used earlier)
                         required_keys = ("scene", "brand_id", "gender", "buddy_gender", "buddy_number", "user_image_url", "buddy_image_url")
                         missing = [k for k in required_keys if not session.get(k)]
                         if missing:
@@ -1475,7 +1505,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(save_session_snapshot, from_phone, session)
                             continue
 
-                        # Build final inputs
                         p1_url = session["user_image_url"]
                         p2_url = session["buddy_image_url"]
                         scene = session["scene"]
@@ -1494,7 +1523,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                         archetype_combined = f"{scene}_{(brand_id or '').strip().lower()}"
 
-
                         # Background worker — queue generation
                         async def _generate_and_send(from_phone: str,
                                                     room_id: str,
@@ -1506,11 +1534,9 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                                     p2_url: str,
                                                     archetype_combined: str) -> None:
                             """
-                            Worker to run generator, poll S3, send final image and persist final session state.
-                            Important: schedule DB writes with asyncio.create_task(...) instead of awaiting them
-                                    to avoid 'Future attached to a different loop' errors.
+                            Generate the image for the requester (from_phone). After sending to requester,
+                            attempt to also send the final image to the buddy (if we can determine their WA number).
                             """
-                            
                             try:
                                 await send_text(from_phone, "Awesome! Generating your image. This can take a bit…")
 
@@ -1518,22 +1544,19 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                                 g1 = (user_gender or "").lower().strip()
                                 g2 = (buddy_gender or "").lower().strip()
+
+                                # generator expects male_first ordering in some cases
                                 if g1 == "female" and g2 == "male":
                                     g1, g2 = g2, g1
                                     p1_url, p2_url = p2_url, p1_url
-                                    logger.debug("Swapped p1/p2 because generator expects male_first ordering.")
-                                combined_gender_folder = f"{g1}_{g2}"
 
+                                combined_gender_folder = f"{g1}_{g2}"
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(from_phone, "Invalid gender combination.")
                                     return
+
                                 logger.info(f"[goldflake] archetype_combined={archetype_combined} upload_key={upload_key}")
-                                brand_id_safe = (brand_id or "").strip().lower()
-                                
-                                
-                                
-                                logger.info(f"[goldflake] starting generation for room_id={room_id} archetype={archetype_combined}")
-                                # Run heavy sync work off the event loop
+
                                 result = await asyncio.to_thread(
                                     _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key, archetype_combined
                                 )
@@ -1544,7 +1567,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     await send_text(from_phone, "Generation failed. Please try again later.")
                                     return
 
-                                # Poll S3 for the result
+                                # wait for upload to appear in S3
                                 for _ in range(120):
                                     try:
                                         _s3.head_object(Bucket=S3_GF_BUCKET, Key=upload_key)
@@ -1556,15 +1579,54 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     await send_text(from_phone, "Upload is taking longer than expected. Please try again shortly.")
                                     return
 
-                                # Presign and send final image
                                 s3_url = presign_get_url(upload_key, expires=3600)
+
+                                # send to requester (existing behaviour)
                                 await send_image_by_link(
                                     to_phone=from_phone,
                                     url=s3_url,
                                     caption=f"{scene.title()} | Tap to view",
                                 )
 
-                                # --- Persist final image URL and mark session done ---
+                                # --- NEW: attempt to also send to buddy ---
+                                try:
+                                    # robustly determine buddy whatsapp for this requester
+                                    buddy_whatsapp = None
+                                    requester_session = get_active_session(from_phone)
+                                    if requester_session:
+                                        # prefer explicitly stored full WA number
+                                        buddy_whatsapp = requester_session.get("buddy_whatsapp")
+                                        # fallback to raw 10-digit buddy_number + prefix from requester
+                                        if not buddy_whatsapp and requester_session.get("buddy_number"):
+                                            digits = re.sub(r"\D", "", requester_session.get("buddy_number") or "")
+                                            if digits:
+                                                try:
+                                                    from_digits = re.sub(r"\D", "", from_phone or "")
+                                                    if len(from_digits) > 10:
+                                                        prefix = from_digits[:-10]
+                                                        buddy_whatsapp = prefix + digits
+                                                    else:
+                                                        buddy_whatsapp = digits
+                                                except Exception:
+                                                    buddy_whatsapp = digits
+
+                                    if buddy_whatsapp:
+                                        # send final image to buddy, with a friend-specific caption
+                                        logger.info(f"[goldflake] sending final image to buddy {buddy_whatsapp} for requester {from_phone}")
+                                        try:
+                                            await send_image_by_link(
+                                                to_phone=buddy_whatsapp,
+                                                url=s3_url,
+                                                caption=f"{scene.title()} — your friend shared this avatar with you. Tap to view",
+                                            )
+                                        except Exception as e:
+                                            logger.exception(f"[goldflake] failed to send final image to buddy {buddy_whatsapp}: {e}")
+                                    else:
+                                        logger.info(f"[goldflake] no buddy_whatsapp found for requester {from_phone}; skipping buddy send")
+                                except Exception as e:
+                                    logger.exception(f"[goldflake] unexpected error while attempting buddy send for {from_phone}: {e}")
+
+                                # persist final image & mark session done for requester
                                 try:
                                     session = get_active_session(from_phone)
                                     if session and session.get("room_id") == room_id:
@@ -1573,8 +1635,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                         session["stage"] = "done"
                                         session["updated_at_utc"] = now_utc_iso()
                                         session["updated_at_ist"] = now_ist_iso()
-
-                                        # schedule snapshot write on the running loop (non-blocking)
                                         try:
                                             asyncio.create_task(save_session_snapshot(from_phone, session))
                                         except Exception as e:
@@ -1596,10 +1656,9 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 except Exception as e:
                                     logger.exception(f"[goldflake] Exception while preparing final snapshot: {e}")
 
-                                # End the session (archive in-memory). await is OK here.
+                                # End the session (archive in-memory)
                                 try:
                                     archived = await end_session(from_phone, reason="completed_success")
-                                    # persist archived session too (scheduled, non-blocking)
                                     if archived:
                                         archived["final_image_url"] = archived.get("final_image_url", s3_url)
                                         archived["status"] = "done"
@@ -1617,8 +1676,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     await send_text(from_phone, "Generation failed. Please try again later.")
                                 except Exception:
                                     pass
-
-                        # schedule the generation (non-blocking)
+      # schedule the generation (non-blocking)
                         background_tasks.add_task(
                             fire_and_forget,
                             _generate_and_send(from_phone, room_id, scene,brand_id, user_gender, buddy_gender, p1_url, p2_url, archetype_combined)
