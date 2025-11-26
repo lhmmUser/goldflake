@@ -15,3 +15,4 @@ users_collection_yippee = _db_sf["user-data"]
 _client_gf = AsyncIOMotorClient(settings.MONGO_URI_GF)
 _db_gf = _client_gf["goldflake-db"]
 users_collection_goldflake = _db_gf["user-data"]
+buddy_collection = _db_gf["buddy-data"]

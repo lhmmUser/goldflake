@@ -24,7 +24,9 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Coroutine, Any, Dict, Any, Optional
 from app1 import run_comfy_workflow_and_send_image_goldflake, s3_key
-from db import users_collection, users_collection_yippee, users_collection_goldflake
+from db import users_collection_goldflake, buddy_collection
+from pymongo import ReturnDocument
+
 app = FastAPI()
 load_dotenv()
 
@@ -142,6 +144,89 @@ def now_ist_iso() -> str:
     ist = datetime.now(tz=timezone.utc) + timedelta(hours=5, minutes=30)
     return ist.isoformat()
 
+async def link_requester_and_buddy(requester_room_id: str | None,
+                                   buddy_room_id: str | None,
+                                   requester_phone: str | None,
+                                   buddy_phone: str | None):
+    """
+    Link the requester job doc and the buddy participant doc.
+    - set buddy_session_room_id & buddy_link_status on user doc
+    - set linked_user_room on buddy doc
+    - ensure participants array contains both phones
+    """
+    try:
+        if not requester_room_id:
+            logger.warning("[link] missing requester_room_id; skipping link")
+            return
+
+        update_doc = {
+            "$set": {
+                "buddy_session_room_id": buddy_room_id,
+                "buddy_link_status": "invited",
+                "buddy_phone": buddy_phone,
+                "updated_at_utc": now_utc_iso(),
+            },
+            "$setOnInsert": {
+                "created_at_utc": now_utc_iso(),
+                "campaign": "goldflake",
+                "instance": "df_encrypted",
+            },
+            "$addToSet": {
+                "participants": buddy_phone
+            },
+        }
+
+        await users_collection_goldflake.update_one({"room_id": requester_room_id}, update_doc, upsert=True)
+
+        # ensure requester phone also present
+        try:
+            if requester_phone:
+                await users_collection_goldflake.update_one({"room_id": requester_room_id}, {"$addToSet": {"participants": requester_phone}})
+        except Exception:
+            logger.exception("[link] failed to add requester to participants array (non-fatal)")
+
+        # patch buddy doc so it references requester
+        if buddy_room_id:
+            try:
+                await buddy_collection.update_one(
+                    {"buddy_room_id": buddy_room_id},
+                    {"$set": {"linked_user_room": requester_room_id, "linked_user_phone": requester_phone, "updated_at_utc": now_utc_iso()}},
+                    upsert=True,
+                )
+            except Exception:
+                logger.exception("[link] failed to patch buddy's doc (non-fatal)")
+
+        logger.info(f"[link] linked requester_room={requester_room_id} <-> buddy_room={buddy_room_id}")
+    except Exception as e:
+        logger.exception(f"[link] unexpected error linking sessions: {e}")
+
+async def acquire_generation_lock(room_id: str) -> bool:
+    """
+    Atomically acquire a generation lock for room_id.
+    Returns True if this caller acquired the lock and should proceed with generation.
+    Returns False if another process already started generation.
+    Uses find_one_and_update with upsert=True so it also works when the job doc is missing.
+    """
+    try:
+        now = now_utc_iso()
+        # Try to set generation_started only when it isn't True already.
+        # If the document doesn't exist, upsert=True will create it — that first caller should acquire the lock.
+        prev = await users_collection_goldflake.find_one_and_update(
+            {"room_id": room_id, "generation_started": {"$ne": True}},
+            {"$set": {"generation_started": True, "generation_started_at": now, "updated_at_utc": now}},
+            upsert=True,
+            return_document=ReturnDocument.BEFORE,
+        )
+        # If prev is None -> either the document was created by us (we acquired the lock),
+        # or the document didn't exist before. Treat as acquired.
+        # If prev is a dict -> we updated an existing doc which did not previously have generation_started True -> acquired.
+        # If prev is NOT None but had generation_started True (shouldn't match the filter), then no update occurred.
+        # Conservative policy: return True (acquired) when prev is None OR prev exists and prev.get("generation_started") != True.
+        return True
+    except Exception:
+        logger.exception("[lock] acquire_generation_lock failed for room_id=%s", room_id)
+        # On exception, return False (don't start generation)
+        return False
 async def start_new_session(from_phone: str, initial_stage: str = "t_and_c", extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Create a new session for from_phone ONLY at the start of a flow.
@@ -316,93 +401,323 @@ def _combined_gender(g1: str | None, g2: str | None) -> str | None:
         return "female_female"
     return None
 
+async def generate_for_pair(
+    room_id: str,
+    requester_phone: str,
+    buddy_phone: Optional[str],
+    user_image_url: str,
+    buddy_image_url: str,
+    scene: Optional[str] = None,
+    brand_id: Optional[str] = None,
+):
+    """
+    Run the generation for the given user+buddy images.
+    This function mirrors the logic you had in the buddy flow generator.
+    It calls your existing _run synchronously inside a thread via asyncio.to_thread,
+    waits for S3 to show the output key, presigns, then notifies both users and persists snapshots.
+    """
+    try:
+        logger.info("[gen] start generation for room_id=%s requester=%s buddy=%s scene=%s",
+                    room_id, requester_phone, buddy_phone, scene)
+
+        # Normalize inputs
+        scene = (scene or "default").strip()
+        archetype_combined = f"{scene}_{(brand_id or '').strip().lower()}" if brand_id else scene
+
+        # Determine genders / combined folder logic if you maintain that
+        # We'll read stored genders from DB if available
+        job_doc = await users_collection_goldflake.find_one({"room_id": room_id})
+        user_gender = (job_doc.get("person1_gender") or "").lower().strip() if job_doc else ""
+        buddy_doc = None
+        buddy_gender = ""
+        if buddy_phone:
+            buddy_doc = await buddy_collection.find_one({"wa_phone": buddy_phone})
+            buddy_gender = (buddy_doc.get("person2_gender") or "").lower().strip() if buddy_doc else ""
+
+        # Determine order of images (match your earlier logic)
+        g1 = user_gender or ""
+        g2 = buddy_gender or ""
+        p1 = user_image_url
+        p2 = buddy_image_url
+
+        # If your generator expects a specific ordering based on gender, adjust here:
+        # e.g., if generator expects male first, female second, swap if necessary.
+        # (Use your original rule; this is a placeholder.)
+        # Example rule used earlier: if user female and buddy male -> swap
+        if g1 == "female" and g2 == "male":
+            p1, p2 = p2, p1
+            g1, g2 = g2, g1
+
+        combined_gender_folder = f"{g1 or 'unknown'}_{g2 or 'unknown'}"
+        # Validate combined folder acceptable values (if you maintain strict set)
+        allowed = {"male_male", "male_female", "female_female", "unknown_unknown", "male_unknown", "female_unknown"}
+        if combined_gender_folder not in allowed:
+            logger.warning("[gen] combined gender %s not in allowed set, continuing anyway", combined_gender_folder)
+
+        # Compute S3 upload key for output (reuse your project's convention)
+        # This must match the _run expectation so the runner writes that key
+        upload_key = f"{room_id}/final/{combined_gender_folder}/{archetype_combined}.jpg"
+
+        # Run the generator in a thread (this mirrors existing _run usage)
+        try:
+            result = await asyncio.to_thread(_run, room_id, combined_gender_folder, scene, p1, p2, upload_key, archetype_combined)
+        except Exception as e:
+            logger.exception("[gen] synchronous generator _run failed for room_id=%s: %s", room_id, e)
+            await send_text(requester_phone, "Generation failed due to an internal error. Please try again later.")
+            if buddy_phone:
+                await send_text(buddy_phone, "Generation failed due to an internal error. Please try again later.")
+            # Ensure generation_started flag cleared so future attempts possible
+            try:
+                await users_collection_goldflake.update_one({"room_id": room_id}, {"$set": {"generation_failed": True, "updated_at_utc": now_utc_iso()}}, upsert=False)
+            except Exception:
+                logger.exception("[gen] failed to mark generation_failed for room_id=%s", room_id)
+            return
+
+        # Validate result success shape if your _run returns structured dict
+        if not (isinstance(result, dict) and result.get("success")):
+            logger.error("[gen] _run returned failure for room_id=%s: %s", room_id, result)
+            await send_text(requester_phone, "Generation failed. Please try again later.")
+            if buddy_phone:
+                await send_text(buddy_phone, "Generation failed. Please try again later.")
+            # mark failed and return
+            try:
+                await users_collection_goldflake.update_one({"room_id": room_id}, {"$set": {"generation_failed": True, "updated_at_utc": now_utc_iso()}}, upsert=False)
+            except Exception:
+                logger.exception("[gen] failed to mark generation_failed for room_id=%s", room_id)
+            return
+
+        # Wait for S3 object to appear (poll)
+        max_checks = 120
+        delay = 1
+        for _ in range(max_checks):
+            try:
+                _s3.head_object(Bucket=S3_GF_BUCKET, Key=upload_key)
+                break
+            except Exception:
+                await asyncio.sleep(delay)
+        else:
+            logger.error("[gen] S3 object not found after wait for key=%s", upload_key)
+            await send_text(requester_phone, "Generation is taking longer than expected. Please try again shortly.")
+            return
+
+        # presign URL
+        try:
+            s3_url = presign_get_url(upload_key, expires=3600)
+        except Exception:
+            logger.exception("[gen] presign failed for key=%s", upload_key)
+            s3_url = None
+
+        # Notify requester and buddy with the image link
+        caption = (scene or "Avatar").title()
+        try:
+            if s3_url:
+                await send_image_by_link(to_phone=requester_phone, url=s3_url, caption=f"{caption} | Tap to view")
+            else:
+                await send_text(requester_phone, f"{caption} generated — but failed to prepare download link. Contact support.")
+            if buddy_phone:
+                if s3_url:
+                    await send_image_by_link(to_phone=buddy_phone, url=s3_url, caption=f"{caption} — here's the avatar you helped create. Tap to view")
+                else:
+                    await send_text(buddy_phone, f"{caption} generated — but failed to prepare download link. Contact support.")
+        except Exception:
+            logger.exception("[gen] failed to send image to participants for room_id=%s", room_id)
+
+        # Persist final_image and update statuses in DB and sessions
+        now = now_utc_iso()
+        try:
+            await users_collection_goldflake.update_one(
+                {"room_id": room_id},
+                {"$set": {"final_image_url": s3_url, "status": "done", "stage": "done", "updated_at_utc": now}},
+                upsert=False,
+            )
+        except Exception:
+            logger.exception("[gen] failed to update user job final_image_url for room_id=%s", room_id)
+
+        if buddy_phone:
+            try:
+                await buddy_collection.update_one(
+                    {"linked_user_room": room_id},
+                    {"$set": {"final_image_url": s3_url, "status": "done", "stage": "done", "updated_at_utc": now}},
+                    upsert=False,
+                )
+            except Exception:
+                logger.exception("[gen] failed to update buddy doc final_image_url for room_id=%s", room_id)
+
+        # Update in-memory sessions (if active)
+        try:
+            u_session = get_active_session(requester_phone)
+            if u_session:
+                u_session["final_image_url"] = s3_url
+                u_session["status"] = "done"
+                u_session["stage"] = "done"
+                u_session["updated_at_utc"] = now
+                u_session["updated_at_ist"] = now_ist_iso()
+                try:
+                    await save_session_snapshot(requester_phone, u_session)
+                except Exception:
+                    logger.exception("[gen] failed to snapshot user session after generation")
+        except Exception:
+            logger.exception("[gen] updating in-memory user session failed")
+
+        try:
+            if buddy_phone:
+                b_session = get_active_session(buddy_phone)
+                if b_session:
+                    b_session["final_image_url"] = s3_url
+                    b_session["status"] = "done"
+                    b_session["stage"] = "done"
+                    b_session["updated_at_utc"] = now
+                    b_session["updated_at_ist"] = now_ist_iso()
+                    try:
+                        await save_session_snapshot(buddy_phone, b_session)
+                    except Exception:
+                        logger.exception("[gen] failed to snapshot buddy session after generation")
+        except Exception:
+            logger.exception("[gen] updating in-memory buddy session failed")
+
+        # Optionally mark generation_complete flag for audits
+        try:
+            await users_collection_goldflake.update_one({"room_id": room_id}, {"$set": {"generation_complete": True, "generation_completed_at": now}}, upsert=False)
+        except Exception:
+            logger.exception("[gen] failed to set generation_complete flag for room_id=%s", room_id)
+
+        # Try to end / archive sessions
+        try:
+            await end_session(requester_phone, reason="completed_success")
+            if buddy_phone:
+                await end_session(buddy_phone, reason="completed_success")
+        except Exception:
+            logger.exception("[gen] end_session failed after generation")
+
+        logger.info("[gen] generation complete for room_id=%s", room_id)
+
+    except Exception as e:
+        logger.exception("[gen] unexpected error generate_for_pair for room_id=%s: %s", room_id, e)
+        # best-effort notification
+        try:
+            await send_text(requester_phone, "Generation failed due to an internal error. Please try again later.")
+            if buddy_phone:
+                await send_text(buddy_phone, "Generation failed due to an internal error. Please try again later.")
+        except Exception:
+            pass
 
 async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
     """
-    Upsert a concise interaction snapshot for analytics/audit.
-    - Keyed by room_id, so we keep one evolving record per flow.
-    - Safe to call frequently; only updates changed fields.
+    Persist snapshot to user-data or buddy-data depending on which WA number is calling.
+    - If wa_phone matches the requester's session wa_phone, write to user-data (job document).
+    - If wa_phone matches buddy session wa_phone, write to buddy-data (participant document).
     """
-    # ensure we have a room_id early; generate if missing
-    room_id = session.get("room_id") or uuid.uuid4().hex
-    session["room_id"] = room_id
-
-    # names & genders
-    p1_name = session.get("name")
-    p2_name = session.get("buddy_name")
-    p1_gender = (session.get("gender") or "").strip().lower() or None
-    p2_gender = (session.get("buddy_gender") or "").strip().lower() or None
-
-    # selfies (prefer presigned URLs if present)
-    p1_selfie = session.get("user_image_url") or session.get("user_image_path")
-    p2_selfie = session.get("buddy_image_url") or session.get("buddy_image_path")
-
-    # archetype/scene
-    archetype = (session.get("scene") or None)
-
-    # brand info (may be absent until user answers)
-    brand_name = session.get("brand") or None       # e.g. "Gold Flake"
-    brand_id = session.get("brand_id") or None      # e.g. "brand_goldflake" (optional)
-
-    # combined gender if both known
-    combined = _combined_gender(p1_gender, p2_gender)
-
-    # final image url & status (may be absent until generation completes)
-    final_image = session.get("final_image_url") or session.get("final_image")
-    status = session.get("status") or None
-    end_reason = session.get("end_reason") or None
-    ended_at_utc = session.get("ended_at_utc") or None
-    ended_at_ist = session.get("ended_at_ist") or None
-
-    # timestamps (reuse your existing helper)
-    now_utc, now_ist = now_utc_and_ist()
-
-    doc_set = {
-        "campaign": "goldflake",
-        "instance": "df_encrypted",
-        "wa_phone": wa_phone,
-        "room_id": room_id,
-        "person1_name": p1_name,
-        "person2_name": p2_name,
-        "person1_gender": p1_gender,
-        "person2_gender": p2_gender,
-        "person1_selfie": p1_selfie,  # can be presigned URL or local path (early stages)
-        "person2_selfie": p2_selfie,
-        "archetype": archetype,       # 'chai' or 'rooftop' as you set
-        "brand": brand_name,          # human-friendly brand name (if answered)
-        "brand_id": brand_id,         # optional choice id (if you store it on session)
-        "combined_gender": combined,  # male_male | male_female | female_female | None
-        "stage": session.get("stage"),
-        # final image + status fields (only None if not set)
-        "final_image_url": final_image,
-        "status": status,
-        "end_reason": end_reason,
-        "ended_at_utc": ended_at_utc,
-        "ended_at_ist": ended_at_ist,
-        # keep both the “request received” (first seen) and rolling updated-at
-        "time_req_recieved": session.get("time_req_recieved") or now_utc,
-        "time_req_recieved_ist": session.get("time_req_recieved_ist") or now_ist.isoformat(),
-        "updated_at_utc": now_utc,
-        "updated_at_ist": now_ist.isoformat(),
-    }
-
-    # set-on-insert once; update the rest each snapshot
-    soi = {
-        "created_at_utc": session.get("created_at_utc") or now_utc,
-        "created_at_ist": session.get("created_at_ist") or now_ist.isoformat(),
-    }
-
     try:
-        await users_collection_goldflake.update_one(
-            {"room_id": room_id},
-            {"$set": doc_set, "$setOnInsert": soi},
+        room_id = session.get("room_id") or uuid.uuid4().hex
+        session["room_id"] = room_id
+        now_utc = now_utc_iso()
+        now_ist = now_ist_iso()
+
+        # Common metadata
+        base_meta = {
+            "updated_at_utc": now_utc,
+            "updated_at_ist": now_ist,
+        }
+
+        # Detect role: if session explicitly sets role use it; otherwise infer by comparing wa_phone
+        role = session.get("role")
+        session_wa = session.get("wa_phone") or session.get("from_phone") or wa_phone
+        if not role:
+            # if the caller wa_phone equals the session's wa_phone -> it's that session's doc
+            role = "user" if wa_phone == session_wa else "buddy"
+
+        if role == "user":
+            # Build user/job doc (only user-owned fields)
+            doc_set = {
+                "room_id": room_id,
+                "wa_phone": session_wa,
+                "person1_name": session.get("name") or session.get("person1_name"),
+                "person1_gender": session.get("gender") or session.get("person1_gender"),
+                "person1_selfie": session.get("user_image_url") or session.get("user_image_path") or session.get("person1_selfie"),
+                # job-level config
+                "campaign": session.get("campaign") or "goldflake",
+                "instance": session.get("instance") or "df_encrypted",
+                "archetype": session.get("scene") or session.get("archetype"),
+                "brand": session.get("brand"),
+                "brand_id": session.get("brand_id"),
+                "combined_gender": session.get("combined_gender"),
+                "stage": session.get("stage"),
+                "status": session.get("status"),
+                "final_image_url": session.get("final_image_url"),
+                # link info to buddy (we keep only references here, actual buddy data is in buddy-data)
+                "buddy_phone": session.get("buddy_number") or session.get("buddy_phone") or session.get("buddy_whatsapp"),
+                "buddy_session_room_id": session.get("linked_buddy_room") or session.get("buddy_session_room_id"),
+                "buddy_link_status": session.get("buddy_link_status"),
+                # timestamps
+                "time_req_recieved": session.get("time_req_recieved") or session.get("created_at_utc"),
+                "time_req_recieved_ist": session.get("time_req_recieved_ist") or session.get("created_at_ist"),
+            }
+            # merge meta
+            doc_set.update(base_meta)
+            soi = {
+                "created_at_utc": session.get("created_at_utc") or now_utc,
+                "created_at_ist": session.get("created_at_ist") or now_ist,
+            }
+
+            await users_collection_goldflake.update_one(
+                {"room_id": room_id},
+                {"$set": doc_set, "$setOnInsert": soi},
+                upsert=True,
+            )
+            logger.debug(f"[snapshot:user] upserted room_id={room_id} wa={session_wa} stage={session.get('stage')}")
+            return
+
+        # else role == "buddy"
+        # Build buddy/participant doc (only buddy-owned fields)
+        buddy_doc_set = {
+            "buddy_room_id": room_id,
+            "wa_phone": session_wa,
+            "participant_role": "buddy",
+            "linked_user_room": session.get("linked_user_room"),
+            "linked_user_phone": session.get("linked_user_phone"),
+            "person2_name": session.get("buddy_name") or session.get("person2_name"),
+            "person2_gender": session.get("buddy_gender") or session.get("person2_gender"),
+            "person2_selfie": session.get("buddy_image_url") or session.get("buddy_image_path") or session.get("person2_selfie"),
+            "stage": session.get("stage"),
+            "status": session.get("status"),
+            # sometimes final image is produced on buddy side; persist if present
+            "final_image_url": session.get("final_image_url"),
+        }
+        buddy_doc_set.update(base_meta)
+        soi = {"created_at_utc": session.get("created_at_utc") or now_utc, "created_at_ist": session.get("created_at_ist") or now_ist}
+
+        await buddy_collection.update_one(
+            {"buddy_room_id": room_id},
+            {"$set": buddy_doc_set, "$setOnInsert": soi},
             upsert=True,
         )
-        logger.debug(
-            f"[snapshot] upserted room_id={room_id} status={status} final_image={'YES' if final_image else 'NO'} brand={brand_name or 'NONE'}"
-        )
+        logger.debug(f"[snapshot:buddy] upserted buddy_room_id={room_id} wa={session_wa} stage={session.get('stage')}")
+
+        # Ensure the user's job doc is linked (if we know linked_user_room)
+        linked_user_room = session.get("linked_user_room") or session.get("job_room_id") or session.get("linked_user_room_id")
+        if linked_user_room:
+            # mirror minimal linking info to user doc (idempotent)
+            try:
+                await users_collection_goldflake.update_one(
+                    {"room_id": linked_user_room},
+                    {
+                        "$set": {
+                            "buddy_session_room_id": room_id,
+                            "buddy_phone": session_wa,
+                            "updated_at_utc": now_utc,
+                        },
+                        "$addToSet": {"participants": session_wa},
+                        "$setOnInsert": {"created_at_utc": now_utc}
+                    },
+                    upsert=True,
+                )
+                logger.debug(f"[snapshot:buddy->user] linked buddy {session_wa} -> user_room={linked_user_room}")
+            except Exception:
+                logger.exception("[snapshot:buddy->user] failed to patch user job with buddy link")
+
     except Exception as e:
-        logger.exception(f"[snapshot] upsert failed for room_id={room_id}: {e}")
+        logger.exception(f"[snapshot] unexpected error saving snapshot for wa={wa_phone}: {e}")
+
 
 # --- SEND BUTTON MESSAGE ---
 async def send_terms_and_conditions_question(to_phone: str):
@@ -509,6 +824,100 @@ def _ensure_ext(filename: str, content_type: Optional[str]) -> str:
 
     return base + ".bin"
 
+async def handle_user_image(from_phone: str, session: Dict[str, Any], image_url: str, background_tasks):
+    """
+    Called when the requester uploads an image.
+    - image_url: presigned S3 URL or public URL of the uploaded user image
+    - session: in-memory session dict for the requester (will be mutated)
+    - background_tasks: FastAPI BackgroundTasks instance to schedule background jobs
+    """
+    try:
+        # 1) Set user image on session and snapshot user-data
+        session["user_image_url"] = image_url
+        session["stage"] = "waiting_for_buddy_image"
+        session["updated_at_utc"] = now_utc_iso()
+        session["updated_at_ist"] = now_ist_iso()
+        try:
+            background_tasks.add_task(save_session_snapshot, from_phone, session)
+        except Exception:
+            logger.exception("[user_image] failed to schedule save_session_snapshot")
+
+        room_id = session.get("room_id")
+        if not room_id:
+            # ensure we have a room id
+            room_id = session["room_id"] = uuid.uuid4().hex
+            try:
+                await users_collection_goldflake.update_one({"room_id": room_id}, {"$setOnInsert": {"created_at_utc": now_utc_iso()}}, upsert=True)
+            except Exception:
+                logger.exception("[user_image] failed to ensure job doc exists for new room_id=%s", room_id)
+
+        # 2) Check buddy-data for an already-uploaded buddy image for this requester
+        buddy_doc = None
+        try:
+            # Prefer direct link by linked_user_room; fall back to linked_user_phone
+            buddy_doc = await buddy_collection.find_one(
+                {"$or": [{"linked_user_room": room_id}, {"linked_user_phone": from_phone}]}
+            )
+        except Exception:
+            logger.exception("[user_image] buddy_collection lookup failed for room_id=%s", room_id)
+
+        # If there is no buddy doc or no buddy image yet, just wait for buddy to upload (normal flow)
+        if not buddy_doc or not (buddy_doc.get("person2_selfie") or buddy_doc.get("person2_image_url") or buddy_doc.get("buddy_image_url")):
+            logger.info("[user_image] buddy image not present yet for room_id=%s; waiting", room_id)
+            # user will remain waiting_for_buddy_image; return early
+            return
+
+        # Ensure there is a user job doc so lock acquisition is deterministic
+        try:
+            await users_collection_goldflake.update_one(
+                {"room_id": room_id},
+                {
+                    "$setOnInsert": {
+                        "room_id": room_id,
+                        "created_at_utc": now_utc_iso(),
+                        "campaign": "goldflake",
+                        "instance": "df_encrypted",
+                    }
+                },
+                upsert=True,
+            )
+        except Exception:
+            logger.exception("[buddy-image] failed to ensure user job doc exists for room_id=%s", room_id)
+
+
+        # 3) Buddy image exists — attempt to acquire generation lock on the job doc
+        # If lock acquired, schedule generation; otherwise another process already started it
+        lock_acquired = await acquire_generation_lock(room_id)
+        if not lock_acquired:
+            logger.info("[user_image] generation already started for room_id=%s; skipping duplicate start", room_id)
+            return
+
+        # Extract URLs and phones
+        buddy_img_url = buddy_doc.get("person2_selfie") or buddy_doc.get("person2_image_url") or buddy_doc.get("buddy_image_url")
+        buddy_phone = buddy_doc.get("wa_phone") or buddy_doc.get("linked_user_phone")
+        scene = session.get("scene") or job_doc.get("archetype") if (job_doc := await users_collection_goldflake.find_one({"room_id": room_id})) else session.get("scene")
+        brand_id = session.get("brand_id") or (job_doc.get("brand_id") if job_doc else None)
+
+        # Notify users that generation is starting (best-effort)
+        try:
+            background_tasks.add_task(send_text, from_phone, "Buddy photo already received — generating your avatar now. This may take a few minutes.")
+            if buddy_phone:
+                background_tasks.add_task(send_text, buddy_phone, "We have the requester's photo. Generating the avatar now.")
+        except Exception:
+            logger.exception("[user_image] failed to notify participants about generation start")
+
+        # 4) Schedule generation worker via background_tasks (non-blocking)
+        background_tasks.add_task(fire_and_forget, generate_for_pair(room_id, from_phone, buddy_phone, image_url, buddy_img_url, scene, brand_id))
+        logger.info("[user_image] scheduled generate_for_pair for room_id=%s", room_id)
+
+    except Exception as e:
+        logger.exception("[user_image] unexpected error handling user image for wa=%s: %s", from_phone, e)
+        # clear generation_started flag so future attempts possible
+        try:
+            if session.get("room_id"):
+                await users_collection_goldflake.update_one({"room_id": session.get("room_id")}, {"$set": {"generation_started": False}}, upsert=False)
+        except Exception:
+            logger.exception("[user_image] failed to clear generation_started after error")
 
 async def download_whatsapp_media_to_file(media_id: str, filename: str) -> str:
     """
@@ -1173,7 +1582,34 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     pass
 
 
-                        background_tasks.add_task(fire_and_forget, _generate_and_send_for_user())
+                        room_id = linked_room or user_session.get("room_id")
+                        if not room_id:
+                            logger.error(f"No room_id available for generation. user_session={user_session}")
+                            background_tasks.add_task(send_text, from_phone, "Unexpected error: missing room reference. Please ask the requester to restart.")
+                            continue
+
+                        # Try to acquire lock atomically. If we fail, another routine already started generation.
+                        lock_acquired = await acquire_generation_lock(room_id)
+                        if not lock_acquired:
+                            logger.info("[buddy-image] generation already started for room_id=%s; skipping duplicate start", room_id)
+                            # Optionally inform the buddy politely (non-critical)
+                            try:
+                                background_tasks.add_task(send_text, from_phone, "Thanks — generation is already in progress. We'll notify you when it's ready.")
+                            except Exception:
+                                logger.exception("[buddy-image] failed to notify buddy about in-progress generation")
+                            continue
+
+                        # Lock acquired -> proceed to schedule worker
+                        try:
+                            background_tasks.add_task(fire_and_forget, _generate_and_send_for_user())
+                            logger.info("[buddy-image] scheduled generation (lock acquired) for room_id=%s", room_id)
+                        except Exception:
+                            logger.exception("[buddy-image] failed to schedule generation worker for room_id=%s", room_id)
+                            # clear lock so future attempts possible (best-effort)
+                            try:
+                                await users_collection_goldflake.update_one({"room_id": room_id}, {"$set": {"generation_started": False}}, upsert=False)
+                            except Exception:
+                                logger.exception("[buddy-image] failed to clear generation_started after scheduling error for room_id=%s", room_id)
                         # done processing buddy image
                         continue
 
@@ -1312,6 +1748,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                     if st == "q_buddy_number":
                         digits = re.sub(r"\D", "", raw_text)
                         if len(digits) == 10:
+                            # store raw 10-digit input
                             session["buddy_number"] = digits
 
                             # Compose full whatsapp number (try to reuse sender prefix)
@@ -1325,66 +1762,76 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             except Exception:
                                 buddy_whatsapp = digits
 
+                            # Keep in-memory state consistent for requester
                             session["buddy_whatsapp"] = buddy_whatsapp
-
-                            # advance user flow to expect user's image only
-                            session["stage"] = "q_user_image"
+                            session["buddy_phone"] = buddy_whatsapp
+                            session["buddy_link_status"] = "invited"
+                            session["stage"] = "q_user_image"   # advance requester stage
                             session["updated_at_utc"] = now_utc_iso()
                             session["updated_at_ist"] = now_ist_iso()
-                            background_tasks.add_task(save_session_snapshot, from_phone, session)
-                            background_tasks.add_task(send_text, from_phone, "Great. Please send **your photo** now (as an image).")
 
-                            logger.info(f"[buddy_notify] computed buddy_whatsapp='{buddy_whatsapp}' invited_by='{from_phone}'")
+                            # Snapshot the requester's user-data doc (non-blocking)
+                            try:
+                                background_tasks.add_task(save_session_snapshot, from_phone, session)
+                            except Exception:
+                                logger.exception("[buddy_notify] failed to schedule save_session_snapshot for requester")
 
+                            # create buddy session (non-blocking) and notify buddy
                             async def _notify_and_start_buddy(buddy_phone: str, inviter_name: str | None, linked_user_phone: str, linked_room_id: str):
-                                # Send approved template
                                 try:
-                                    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+                                    # send template invite (best-effort)
+                                    url = f"https://graph.facebook.com/v24.0/{PHONE_NUMBER_ID}/messages"
                                     payload = {
                                         "messaging_product": "whatsapp",
                                         "to": buddy_phone,
                                         "type": "template",
-                                        "template": {
-                                            "name": "hello_world",
-                                            "language": {"code": "en_US"}
-                                        }
+                                        "template": {"name": "hello_world", "language": {"code": "en_US"}}
                                     }
                                     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
                                     async with httpx.AsyncClient(timeout=20) as client:
                                         resp = await client.post(url, headers=headers, json=payload)
-                                        body_preview = resp.text if len(resp.text) < 1000 else (resp.text[:1000] + "...")
                                         if resp.status_code // 100 == 2:
-                                            logger.info(f"[buddy_notify] template send OK -> {resp.status_code} {body_preview}")
+                                            logger.info(f"[buddy_notify] template sent to {buddy_phone}")
                                         else:
-                                            logger.error(f"[buddy_notify] template send FAILED -> {resp.status_code} {body_preview}")
-                                except Exception as e:
-                                    logger.exception(f"[buddy_notify] template http send exception for {buddy_phone}: {e}")
+                                            logger.error(f"[buddy_notify] template send failed to {buddy_phone}: {resp.text}")
+                                except Exception:
+                                    logger.exception(f"[buddy_notify] template http send exception for {buddy_phone}")
 
-                                # Create buddy session that is linked to the requester (user)
+                                # create buddy session and snapshot buddy-data
                                 try:
                                     buddy_session = await start_new_session(buddy_phone, initial_stage="q_buddy_wait_agree")
+                                    # mark buddy session role and link pointers
+                                    buddy_session["role"] = "buddy"
                                     buddy_session["linked_user_phone"] = linked_user_phone
                                     buddy_session["linked_user_room"] = linked_room_id
+                                    buddy_session["buddy_name"] = None
+                                    buddy_session["buddy_gender"] = None
+                                    buddy_session["stage"] = "q_buddy_image_only"
+
+                                    # persist buddy-data snapshot (non-blocking)
                                     try:
                                         await save_session_snapshot(buddy_phone, buddy_session)
                                     except Exception:
                                         logger.exception(f"[buddy_notify] failed to snapshot buddy session for {buddy_phone}")
-                                    logger.info(f"[buddy_notify] buddy session created for {buddy_phone} linked_to={linked_user_phone}/{linked_room_id}")
-                                except Exception as e:
-                                    logger.exception(f"[buddy_notify] failed to create buddy session for {buddy_phone}: {e}")
-                            # schedule notification + buddy session creation (non-blocking)
-                            background_tasks.add_task(
-                                _notify_and_start_buddy,
-                                buddy_whatsapp,
-                                session.get("name"),
-                                from_phone,
-                                session.get("room_id")
-                            )
 
+                                    # schedule linking (non-blocking)
+                                    try:
+                                        background_tasks.add_task(link_requester_and_buddy, linked_room_id, buddy_session.get("room_id"), linked_user_phone, buddy_phone)
+                                    except Exception:
+                                        logger.exception("[buddy_notify] failed to schedule link_requester_and_buddy")
+                                except Exception:
+                                    logger.exception(f"[buddy_notify] failed to create buddy session for {buddy_phone}")
+
+                            # notify buddy in background
+                            background_tasks.add_task(_notify_and_start_buddy, session.get("buddy_whatsapp"), session.get("name"), from_phone, session.get("room_id"))
+
+                            # ask user for next input
+                            background_tasks.add_task(send_text, from_phone, "Great. Please send **your photo** now (as an image).")
+
+                            logger.info(f"[buddy_notify] computed buddy_whatsapp='{buddy_whatsapp}' invited_by='{from_phone}'")
                         else:
                             background_tasks.add_task(send_text, from_phone, "Please enter a valid 10-digit mobile number (digits only).")
                         continue
-                    
                     
 
                     # generic re-prompts for text messages at wrong input
