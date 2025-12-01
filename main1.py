@@ -11,6 +11,7 @@ from config import settings
 from s3_client import get_s3_client
 from db import users_collection, users_collection_yippee, users_collection_goldflake
 from app1 import run_comfy_workflow_and_send_image, run_comfy_workflow_and_send_image_sf, run_comfy_workflow_and_send_image_goldflake
+import os
 
 try:
     from zoneinfo import ZoneInfo
@@ -29,7 +30,9 @@ s3 = get_s3_client()
 S3_BUCKET   = settings.S3_BUCKET_DF
 S3_BUCKET_2 = settings.S3_BUCKET_YIPPEE
 
+
 # NOTE: moved start_publisher_thread() into a startup hook below
+
 
 @app.middleware("http")
 async def post_counter_mw(request: Request, call_next):
@@ -47,6 +50,10 @@ class MarkUploadedPayload(BaseModel):
     campaign: Literal["darkfantasy", "sunfeast", "goldflake"]
 
 # --- Endpoints ---
+
+def now_utc_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
 
 @app.post("/chat360/webhook")
 async def webhook_df(request: Request, tasks: BackgroundTasks):

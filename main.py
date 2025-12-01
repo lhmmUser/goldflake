@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Query, BackgroundTasks
+from fastapi import FastAPI, Request, Query, BackgroundTasks, HTTPException, Form
 import httpx
 import os
 import logging
@@ -10,12 +10,11 @@ from app1 import run_comfy_workflow_and_send_image_goldflake
 from gender_normalization import normalize_people_dicts
 import mimetypes
 import re
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from main1 import now_utc_and_ist
 from urllib.parse import urlsplit, unquote
 from urllib.request import url2pathname
 from pathlib import Path
-import re
 import urllib.request
 from io import BytesIO
 from PIL import Image
@@ -26,6 +25,8 @@ from typing import Coroutine, Any, Dict, Any, Optional
 from app1 import run_comfy_workflow_and_send_image_goldflake, s3_key
 from db import users_collection_goldflake, buddy_collection
 from pymongo import ReturnDocument
+from pydantic import BaseModel
+
 
 app = FastAPI()
 load_dotenv()
@@ -39,7 +40,8 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_GF_BUCKET = os.getenv("S3_GF_BUCKET") or os.environ["S3_GF_BUCKET"]
 GRAPH_BASE = "https://graph.facebook.com/v21.0" 
-
+BUDDY_CONSENT_URL = os.getenv("BUDDY_CONSENT_URL", "http://127.0.0.1:8000")
+INTERNAL_TOKEN = os.getenv("INTERNAL_INTERNAL_TOKEN", "super-secret")
 # in-memory stores (you may replace with persistent DB later)
 _sessions_active: Dict[str, Dict[str, Any]] = {}   # phone_key -> active session dict
 _sessions_archived: Dict[str, list] = {}          # phone_key -> list of finished sessions
@@ -54,6 +56,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _s3 = boto3.client("s3", region_name=AWS_REGION)
+
+class BuddyConsentPayload(BaseModel):
+    job_id: str  # this is your room_id
+    decision: str  # "agree" or "disagree"
+
 
 def _now() -> float:
     return time.time()
@@ -355,7 +362,6 @@ def presign_get_url(key: str, expires: int = 3600) -> str:
     )
 
 
-
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     # Minimal access log for every request (GET + POST)
@@ -386,6 +392,50 @@ def verify_webhook(
         return int(hub_challenge)
     logger.warning("Unauthorized webhook verification attempt.")
     return {"status": "unauthorized"}
+
+@app.post("/internal/buddy-consent")
+async def internal_buddy_consent(payload: BuddyConsentPayload, request: Request):
+    # 1) Simple auth so random people can’t hit this
+    token = request.headers.get("x-internal-token")
+    if token != INTERNAL_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    job_id = payload.job_id
+    decision = payload.decision.lower()
+
+    if decision not in ("agree", "disagree"):
+        raise HTTPException(status_code=400, detail="Invalid decision")
+
+    # 2) Update DB
+    now = now_utc_iso()
+    await users_collection_goldflake.update_one(
+        {"room_id": job_id},
+        {"$set": {"buddy_consent": decision, "buddy_consent_at": now}},
+    )
+
+    # 3) Find the requester’s phone number
+    user_doc = await users_collection_goldflake.find_one(
+        {"room_id": job_id},
+        {"wa_phone": 1}
+    )
+    requester_phone = user_doc.get("wa_phone") if user_doc else None
+
+    # 4) Notify user on WhatsApp
+    if requester_phone:
+        if decision == "agree":
+            await send_text(
+                requester_phone,
+                "Your buddy has agreed to the terms ✅.\n\nPlease upload your buddy’s photo here to continue."
+            )
+        else:
+            await send_text(
+                requester_phone,
+                "Your buddy did *not* agree to the terms ❌.\n\nSorry, we can’t proceed with this request."
+            )
+
+    return {"status": "ok"}
+
+
 
 def _combined_gender(g1: str | None, g2: str | None) -> str | None:
     g1 = (g1 or "").strip().lower()
@@ -718,6 +768,39 @@ async def save_session_snapshot(wa_phone: str, session: Dict[str, Any]) -> None:
     except Exception as e:
         logger.exception(f"[snapshot] unexpected error saving snapshot for wa={wa_phone}: {e}")
 
+async def send_buddy_consent_message(to_phone: str, job_id: str):
+    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+
+    consent_link = f"{BUDDY_CONSENT_URL}/buddy-consent/{job_id}"
+
+    message_text = (
+        "Share this with your smoke buddy.\n\n"
+        "Ask them to read and accept the consent before you send their photo.\n\n"
+        # URL on its own line so WhatsApp auto-detects it cleanly
+        f"{consent_link}"
+    )
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "text",
+        "text": {
+            "preview_url": True,
+            "body": message_text,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        if resp.status_code // 100 != 2:
+            logger.error(f"Failed to send buddy consent text to {to_phone}: {resp.text}")
+        else:
+            logger.info(f"Buddy consent text sent to {to_phone}")
 
 # --- SEND BUTTON MESSAGE ---
 async def send_terms_and_conditions_question(to_phone: str):
@@ -834,7 +917,7 @@ async def handle_user_image(from_phone: str, session: Dict[str, Any], image_url:
     try:
         # 1) Set user image on session and snapshot user-data
         session["user_image_url"] = image_url
-        session["stage"] = "waiting_for_buddy_image"
+        session["stage"] = "q_buddy_image"
         session["updated_at_utc"] = now_utc_iso()
         session["updated_at_ist"] = now_ist_iso()
         try:
@@ -1701,12 +1784,23 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     if st == "q_buddy_gender" and choice_id in {"gender_buddy_male", "gender_buddy_female"}:
                         session["buddy_gender"] = "male" if choice_id == "gender_buddy_male" else "female"
-                        session["stage"] = "q_buddy_number"
+
+                        # New flow:
+                        # 1) send consent message with hyperlink (user forwards this to buddy)
+                        # 2) move to asking for user's own photo in the same chat
+                        session["stage"] = "q_user_image"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
-                        background_tasks.add_task(send_buddy_number_question, from_phone)
+
+                        background_tasks.add_task(send_buddy_consent_message, from_phone, session.get("room_id") )
+                        background_tasks.add_task(
+                            send_text,
+                            from_phone,
+                            "Now send your *own* photo here as an image.",
+                        )
                         continue
+
 
                     background_tasks.add_task(send_text, from_phone, "Let’s continue. Please follow the prompts.")
                     continue
@@ -1896,17 +1990,81 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        session["stage"] = "waiting_for_buddy_image"
+                        # ---- NEW: gate next step on buddy_consent ----
+                        job_doc = await users_collection_goldflake.find_one(
+                            {"room_id": room_id},
+                            {"buddy_consent": 1}
+                        )
+                        consent = (job_doc or {}).get("buddy_consent")
+
+                        if consent == "disagree":
+                            # buddy explicitly refused
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "Your buddy did not agree to the terms. Sorry, we can’t proceed with this flow.",
+                            )
+                            await end_session(from_phone, reason="buddy_disagreed")
+                            continue
+
+                        if consent == "agree":
+                            # buddy has already agreed -> allow buddy photo stage
+                            session["stage"] = "q_buddy_image"
+                            session["updated_at_utc"] = now_utc_iso()
+                            session["updated_at_ist"] = now_ist_iso()
+                            background_tasks.add_task(save_session_snapshot, from_phone, session)
+
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "Got your photo 👍\n\nNow send your *buddy’s* photo here as an image.",
+                            )
+                            continue
+
+                        # consent is missing / None -> waiting for buddy approval
+                        session["stage"] = "waiting_for_buddy_approval"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
 
-                        background_tasks.add_task(send_text, from_phone,
-                                                 "Got your photo. We invited your buddy to upload their photo — we'll start generating once they send it.")
+                        background_tasks.add_task(
+                            send_text,
+                            from_phone,
+                            "Got your photo 👍\n\nWe’re waiting for your buddy’s approval. "
+                            "Ask them to open the consent link and tap *I agree* so you can continue.",
+                        )
                         continue
+
 
                     # legacy branch: requester uploading buddy image (backwards compatibility)
                     if session.get("stage") == "q_buddy_image":
+                        # ---- NEW: check buddy_consent again before accepting image ----
+                        job_doc = await users_collection_goldflake.find_one(
+                            {"room_id": room_id},
+                            {"buddy_consent": 1}
+                        )
+                        consent = (job_doc or {}).get("buddy_consent")
+
+                        if consent == "disagree":
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "Your buddy did not agree to the terms. Sorry, we can’t proceed with this flow.",
+                            )
+                            await end_session(from_phone, reason="buddy_disagreed")
+                            continue
+
+                        if consent != "agree":
+                            # buddy hasn’t replied yet
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "We’re still waiting for your buddy’s approval. "
+                                "Ask them to open the consent link and tap *I agree*.",
+                            )
+                            continue
+
+                        # consent == "agree" → allow buddy image upload
                         filename = f"{room_id}_p2.jpg"
                         try:
                             abs_path = await download_whatsapp_media_to_file(media_id, filename)
@@ -1929,7 +2087,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
                             continue
 
-                        required_keys = ("scene", "brand_id", "gender", "buddy_gender", "buddy_number", "user_image_url", "buddy_image_url")
+
+                        required_keys = ("scene", "brand_id", "gender", "buddy_gender", "user_image_url", "buddy_image_url")
                         missing = [k for k in required_keys if not session.get(k)]
                         if missing:
                             logger.error(f"Missing fields before goldflake generation: {missing} for {from_phone}")
@@ -2035,44 +2194,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                     caption=f"{scene.title()} | Tap to view",
                                 )
 
-                                # --- NEW: attempt to also send to buddy ---
-                                try:
-                                    # robustly determine buddy whatsapp for this requester
-                                    buddy_whatsapp = None
-                                    requester_session = get_active_session(from_phone)
-                                    if requester_session:
-                                        # prefer explicitly stored full WA number
-                                        buddy_whatsapp = requester_session.get("buddy_whatsapp")
-                                        # fallback to raw 10-digit buddy_number + prefix from requester
-                                        if not buddy_whatsapp and requester_session.get("buddy_number"):
-                                            digits = re.sub(r"\D", "", requester_session.get("buddy_number") or "")
-                                            if digits:
-                                                try:
-                                                    from_digits = re.sub(r"\D", "", from_phone or "")
-                                                    if len(from_digits) > 10:
-                                                        prefix = from_digits[:-10]
-                                                        buddy_whatsapp = prefix + digits
-                                                    else:
-                                                        buddy_whatsapp = digits
-                                                except Exception:
-                                                    buddy_whatsapp = digits
-
-                                    if buddy_whatsapp:
-                                        # send final image to buddy, with a friend-specific caption
-                                        logger.info(f"[goldflake] sending final image to buddy {buddy_whatsapp} for requester {from_phone}")
-                                        try:
-                                            await send_image_by_link(
-                                                to_phone=buddy_whatsapp,
-                                                url=s3_url,
-                                                caption=f"{scene.title()} — your friend shared this avatar with you. Tap to view",
-                                            )
-                                        except Exception as e:
-                                            logger.exception(f"[goldflake] failed to send final image to buddy {buddy_whatsapp}: {e}")
-                                    else:
-                                        logger.info(f"[goldflake] no buddy_whatsapp found for requester {from_phone}; skipping buddy send")
-                                except Exception as e:
-                                    logger.exception(f"[goldflake] unexpected error while attempting buddy send for {from_phone}: {e}")
-
+                               
                                 # persist final image & mark session done for requester
                                 try:
                                     session = get_active_session(from_phone)
@@ -2151,6 +2273,113 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
     # Finish quickly; background tasks do the heavy lifting
     logger.info("Webhook processing complete.")
     return {"status": "ok"}
+
+@app.get("/buddy-consent/{job_id}", response_class=HTMLResponse)
+async def buddy_consent_page(job_id: str):
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Buddy consent</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <style>
+            body {{ font-family: system-ui, sans-serif; padding: 16px; max-width: 480px; margin: auto; }}
+            button {{ padding: 10px 16px; margin: 8px 4px 0 0; }}
+            .danger {{ background:#eee; }}
+        </style>
+    </head>
+    <body>
+        <h2>Buddy Terms & Conditions</h2>
+        <p>Read the terms and conditions and proceed accordingly…..</p>
+
+        <form method="post">
+            <input type="hidden" name="job_id" value="{job_id}" />
+            <button type="submit" name="decision" value="agree">I agree</button>
+            <button type="submit" name="decision" value="disagree" class="danger">I disagree</button>
+        </form>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+@app.post("/buddy-consent/{job_id}", response_class=HTMLResponse)
+async def buddy_consent_submit(job_id: str, decision: str = Form(...)):
+    decision = (decision or "").lower()
+    if decision not in ("agree", "disagree"):
+        decision = "disagree"
+
+    now = now_utc_iso()
+    # 1) update DB
+    await users_collection_goldflake.update_one(
+        {"room_id": job_id},
+        {"$set": {"buddy_consent": decision, "buddy_consent_at": now}},
+    )
+
+    # 2) find requester’s phone
+    user_doc = await users_collection_goldflake.find_one(
+        {"room_id": job_id},
+        {"wa_phone": 1}
+    )
+    requester_phone = user_doc.get("wa_phone") if user_doc else None
+
+    # 3) update in-memory session as well
+    if requester_phone:
+        session = get_active_session(requester_phone)
+
+        if decision == "agree":
+            # if user is stuck in waiting_for_buddy_approval, move them to q_buddy_image
+            if session and session.get("stage") == "waiting_for_buddy_approval":
+                session["stage"] = "q_buddy_image"
+                session["updated_at_utc"] = now_utc_iso()
+                session["updated_at_ist"] = now_ist_iso()
+                try:
+                    await save_session_snapshot(requester_phone, session)
+                except Exception:
+                    logger.exception("[buddy-consent] failed to snapshot session after agree")
+
+            await send_text(
+                requester_phone,
+                "Your buddy has agreed to the terms ✅.\n\nPlease upload your buddy’s photo here to continue."
+            )
+        else:
+            # buddy disagreed: end the requester’s session
+            if session:
+                session["status"] = "done"
+                session["stage"] = "done"
+                session["updated_at_utc"] = now_utc_iso()
+                session["updated_at_ist"] = now_ist_iso()
+                try:
+                    await save_session_snapshot(requester_phone, session)
+                except Exception:
+                    logger.exception("[buddy-consent] failed to snapshot session after disagree")
+                try:
+                    await end_session(requester_phone, reason="buddy_disagreed")
+                except Exception:
+                    logger.exception("[buddy-consent] failed to end session after disagree")
+
+            await send_text(
+                requester_phone,
+                "Your buddy did *not* agree to the terms ❌.\n\nSorry, we can’t proceed with this request."
+            )
+
+    msg = (
+        "Thanks, your consent has been recorded."
+        if decision == "agree"
+        else "You chose not to proceed. Your decision has been recorded."
+    )
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Buddy consent</title></head>
+    <body>
+        <p>{msg}</p>
+        <p>You can now close this page.</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
 
 # --- Buttons: Scene selection (chai / rooftop) ---
 async def send_scene_question(to_phone: str):
