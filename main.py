@@ -1201,7 +1201,7 @@ async def webhook_goldflake(
             logger.error(f"[goldflake] {err}")
             return {"error": err}
 
-        archetype_norm = (archetype or "chai").strip().lower()                # scene/archetype normalized
+        archetype_norm = (archetype or "london_dreams").strip().lower()                # scene/archetype normalized
 
         # ---- Record request metadata (non-blocking if it fails) ----
         now_utc, now_ist = now_utc_and_ist()                                  # your time helper
@@ -1559,8 +1559,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_text, from_phone, "No worries. You can come back anytime to accept and continue 👋")
                         continue
 
-                    if st == "q_scene" and choice_id in {"scene_chai", "scene_rooftop"}:
-                        session["scene"] = "chai" if choice_id == "scene_chai" else "chai_2"
+                    if st == "q_scene" and choice_id in {"scene_london_dreams", "scene_rooftop"}:
+                        session["scene"] = "london_dreams" if choice_id == "scene_london_dreams" else "chai_2"
                         session["stage"] = "q_name"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
@@ -2298,7 +2298,7 @@ async def send_scene_question(to_phone: str):
                         "title": "Scenes",
                         "rows": [
                             {
-                                "id": "scene_chai",
+                                "id": "scene_london_dreams",
                                 "title": "London Bridge",
                                 "description": "London Bridge"
                             },
