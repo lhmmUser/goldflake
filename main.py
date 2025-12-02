@@ -40,7 +40,7 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_GF_BUCKET = os.getenv("S3_GF_BUCKET") or os.environ["S3_GF_BUCKET"]
 GRAPH_BASE = "https://graph.facebook.com/v21.0" 
-BUDDY_CONSENT_URL = os.getenv("BUDDY_CONSENT_URL", "https://5e75129c09a3.ngrok-free.app")
+BUDDY_CONSENT_URL = os.getenv("BUDDY_CONSENT_URL", "https://darkfantasy-en.diffrun.com")
 INTERNAL_TOKEN = os.getenv("INTERNAL_INTERNAL_TOKEN", "super-secret")
 # in-memory stores (you may replace with persistent DB later)
 _sessions_active: Dict[str, Dict[str, Any]] = {}   # phone_key -> active session dict
