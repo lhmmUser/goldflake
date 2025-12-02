@@ -1583,7 +1583,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(
                             send_text,
                             from_phone,
-                            "Great. Please send your *photo* now (as an image)."
+                            "Please provide your photograph"
                         )
                         continue
                     
