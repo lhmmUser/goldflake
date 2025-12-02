@@ -561,7 +561,7 @@ async def generate_for_pair(
         caption = (scene or "Avatar").title()
         try:
             if s3_url:
-                await send_image_by_link(to_phone=requester_phone, url=s3_url, caption=f"{caption} | Tap to view")
+                await send_image_by_link(to_phone=requester_phone, url=s3_url, caption=f"Here you go! ")
             else:
                 await send_text(requester_phone, f"{caption} generated — but failed to prepare download link. Contact support.")
             if buddy_phone:
@@ -807,9 +807,9 @@ async def send_terms_and_conditions_question(to_phone: str):
 
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     body_text = (
-        "Welcome to the world of Snow Flake 🔮– where every bite is a portal to your wildest & spookiest imaginations\n\n"
-        "👩‍🎤 Find your Fantasy avatar and stand a chance to win Amazon vouchers worth Rs. 10,000 every week!🏆\n"
-        "Accept terms and conditions to proceed:"
+        "Please confirm if you are a smoker above the age of 18 and agree to attached terms & conditions:\n\n"
+        
+       
     )
 
     payload = {
@@ -1453,7 +1453,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                 # ---------- Branch: buddy image upload (final buddy stage) ----------
                 if st == "q_buddy_image_only":
                     if msg_type != "image":
-                        background_tasks.add_task(send_text, from_phone, "Please send your photo as an *image* attachment.")
+                        background_tasks.add_task(send_text, from_phone, "Please provide your photgraph")
                         continue
 
                     # download + upload to s3 (use your existing helpers)
@@ -1547,7 +1547,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
-                        background_tasks.add_task(send_text, from_phone, "Great! ✅ Let’s begin.")
+                        background_tasks.add_task(send_text, from_phone, "Thanks for participating into the campaign.")
                         background_tasks.add_task(send_scene_question, from_phone)
                         continue
 
@@ -1938,7 +1938,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             # send link to requester so they can forward it to their buddy
                             
                             background_tasks.add_task(send_text, from_phone,
-                                "Got your photo 👍\n\nWe sent a consent link — please forward that link to your buddy and ask them to open it and tap *I agree*. Once they accept, we'll proceed.")
+                                "Please forward the below message with your buddy")
                             background_tasks.add_task(send_buddy_consent_message, from_phone, session.get("room_id"))
                         continue
 
@@ -2043,7 +2043,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                             attempt to also send the final image to the buddy (if we can determine their WA number).
                             """
                             try:
-                                await send_text(from_phone, "Awesome! Generating your image. This can take a bit…")
+                                await send_text(from_phone, "Please wait while we generate your 'London Dreams' Poster")
 
                                 upload_key = s3_key(room_id, scene)
 
@@ -2090,7 +2090,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 await send_image_by_link(
                                     to_phone=from_phone,
                                     url=s3_url,
-                                    caption=f"{scene.title()} | Tap to view",
+                                    caption=f"Here you go! ",
                                 )
 
                                
@@ -2228,7 +2228,7 @@ async def buddy_consent_submit(job_id: str, decision: str = Form(...)):
             # Inform requester (THIS is correct for your flow)
             await send_text(
                 requester_phone,
-                "Your buddy has agreed to the terms ✅.\n\nPlease enter the following details to continue."
+                "Your buddy has agreed to the terms and has given their permission for participating in the campign"
             )
 
             try:
@@ -2245,7 +2245,7 @@ async def buddy_consent_submit(job_id: str, decision: str = Form(...)):
 
                     # Prompt user again just to be safe
                     try:
-                        await send_text(requester_phone, "Please reply with your buddy's name")
+                        await send_text(requester_phone, "What is your buddy's name?")
                     except Exception:
                         logger.exception("[consent] failed to prompt requester for buddy name after agree")
 
@@ -2300,7 +2300,7 @@ async def send_scene_question(to_phone: str):
                             {
                                 "id": "scene_chai",
                                 "title": "London Bridge",
-                                "description": "Visit London Bridge with your buddy"
+                                "description": "London Bridge"
                             },
                             {
                                 "id": "scene_rooftop",
@@ -2339,7 +2339,7 @@ async def send_gender_question(to_phone: str):
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": "Your gender?"},
+            "body": {"text": "What is your gender?"},
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": "gender_me_male", "title": "Male"}},
