@@ -2176,31 +2176,136 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 @app.get("/buddy-consent/{job_id}", response_class=HTMLResponse)
 async def buddy_consent_page(job_id: str):
     html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Buddy consent</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-            body {{ font-family: system-ui, sans-serif; padding: 16px; max-width: 480px; margin: auto; }}
-            button {{ padding: 10px 16px; margin: 8px 4px 0 0; }}
-            .danger {{ background:#eee; }}
-        </style>
-    </head>
-    <body>
-        <h2>Buddy Terms & Conditions</h2>
-        <p>Read the terms and conditions and proceed accordingly…..</p>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Buddy Consent</title>
 
-        <form method="post">
-            <input type="hidden" name="job_id" value="{job_id}" />
-            <button type="submit" name="decision" value="agree">I agree</button>
-            <button type="submit" name="decision" value="disagree" class="danger">I disagree</button>
-        </form>
-    </body>
-    </html>
+<style>
+  :root {{
+    --canvas-bg: #2b2b2b;
+    --phone-bg: #9f4766;
+    --text-white: #ffffff;
+    --yellow: #ffea00;
+    --yellow-border: #d4c400;          
+    --yellow-text: #b53100;
+    --orange: #d87f33;
+    --orange-border: #b96a28;          
+    --orange-text: #8a301a;
+  }}
+
+  html,body {{
+    margin:0; height:100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
+    background: var(--canvas-bg);
+  }}
+
+  .wrap {{
+    min-height:100vh;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:20px;
+  }}
+
+  .phone {{
+    width:360px;
+    max-width: calc(100% - 40px);
+    height: calc(100vh - 80px);
+    background: var(--phone-bg);
+    border-radius: 18px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    border:6px solid rgba(0,0,0,0.45);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:40px 28px;
+  }}
+
+  .screen {{
+    width:100%; height:100%;
+    background: var(--phone-bg);
+    border-radius:8px;
+    padding:56px 28px;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+  }}
+
+  .headline {{
+    color:white;
+    font-size:20px;
+    line-height:1.35;
+    margin-bottom:36px;
+    white-space:pre-wrap;
+  }}
+
+  .actions {{
+    display:flex;
+    flex-direction:column;
+    gap:18px;
+    align-items:center;
+  }}
+
+  .btn {{
+    width:82%;
+    min-height:54px;
+    border-radius:12px;
+    font-size:20px;
+    font-weight:700;
+    border:4px solid transparent;
+    cursor:pointer;
+  }}
+
+  .btn--agree {{
+    background: var(--yellow);
+    color: var(--yellow-text);
+    border-color: var(--yellow-border); 
+  }}
+
+  .btn--disagree {{
+    background: var(--orange);
+    color: var(--orange-text);
+    border-color: var(--orange-border);   
+  }}
+</style>
+
+</head>
+<body>
+
+<div class="wrap">
+  <div class="phone">
+    <div class="screen">
+
+      <div class="headline">
+Please confirm that you are a smoker, above 18 years of age and not a resident of Tamil Nadu and you consent to your photograph being used to create the poster with Yash……
+      </div>
+
+      <form method="post">
+        <input type="hidden" name="job_id" value="{job_id}" />
+
+        <div class="actions">
+          <button class="btn btn--agree" name="decision" value="agree">
+            I agree
+          </button>
+
+          <button class="btn btn--disagree" name="decision" value="disagree">
+            I don't agree
+          </button>
+        </div>
+
+      </form>
+
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
     """
     return HTMLResponse(content=html)
-
 @app.post("/buddy-consent/{job_id}", response_class=HTMLResponse)
 async def buddy_consent_submit(job_id: str, decision: str = Form(...)):
     decision = (decision or "").lower()
