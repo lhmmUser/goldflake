@@ -2411,3 +2411,7 @@ async def re_prompt_for_stage(session: Dict[str, Any], to_phone: str, background
         background_tasks.add_task(send_buddy_number_question, to_phone)
     else:
         background_tasks.add_task(send_text, to_phone, "Let’s continue. Please follow the prompts.")
+
+@app.get("/", tags=["root"])
+async def root():
+    return {"status": "ok", "message": "FastAPI is running"}
