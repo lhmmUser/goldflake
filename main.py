@@ -2186,7 +2186,7 @@ async def buddy_consent_page(job_id: str):
 <style>
   :root {{
     --canvas-bg: #2b2b2b;
-    --phone-bg: #9f4766;
+    --phone-bg: #8A0303;
     --text-white: #ffffff;
     --yellow: #ffea00;
     --yellow-border: #d4c400;          
