@@ -6,7 +6,7 @@ import uuid
 import time
 from dotenv import load_dotenv
 from typing import Dict, Any, Optional
-from app1 import run_comfy_workflow_and_send_image_goldflake
+from app1 import run_comfy_workflow_and_send_image_goldflake, run_comfy_workflow_and_send_image
 from gender_normalization import normalize_people_dicts
 import mimetypes
 import re
@@ -34,6 +34,7 @@ load_dotenv()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+S3_BUCKET= os.getenv("S3_BUCKET")
 SESSION_TTL_SECONDS = 30      # 30 minutes since last activity
 SESSION_POST_DONE_GRACE = 20    # after we send final image, keep state for 5 minutes
 SESSIONS: Dict[str, Dict[str, Any]] = {} 
@@ -810,7 +811,7 @@ async def send_terms_and_conditions_question(to_phone: str):
 
     url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
     body_text = (
-        "Please confirm if you are a smoker above the age of 18 and agree to attached terms & conditions:\n\n"
+        "Are you a smoker aged 18 or above, and do you agree to the terms?\n\n"
         
        
     )
@@ -1208,7 +1209,7 @@ async def webhook_goldflake(
             logger.error(f"[goldflake] {err}")
             return {"error": err}
 
-        archetype_norm = (archetype or "big_ben").strip().lower()                # scene/archetype normalized
+        archetype_norm = (archetype or "clown").strip().lower()                # scene/archetype normalized
 
         # ---- Record request metadata (non-blocking if it fails) ----
         now_utc, now_ist = now_utc_and_ist()                                  # your time helper
@@ -1558,7 +1559,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
-                        background_tasks.add_task(send_text, from_phone, "Thanks for participating into the campaign.")
+                        background_tasks.add_task(send_text, from_phone, "Great! Thanks for joining the campaign.")
                         background_tasks.add_task(send_scene_question, from_phone)
                         continue
 
@@ -1570,8 +1571,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_text, from_phone, "No worries. You can come back anytime to accept and continue 👋")
                         continue
 
-                    if st == "q_scene" and choice_id in {"scene_big_ben", "scene_rooftop"}:
-                        session["scene"] = "big_ben" if choice_id == "scene_big_ben" else "chai_2"
+                    if st == "q_scene" and choice_id in {"scene_clown", "scene_rooftop"}:
+                        session["scene"] = "clown" if choice_id == "scene_clown" else "chai_2"
                         session["stage"] = "q_name"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
@@ -1594,7 +1595,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(
                             send_text,
                             from_phone,
-                            "Please provide your photograph"
+                            "Please send a clear photo of yourself"
                         )
                         continue
                     
@@ -1877,110 +1878,242 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
 
                     if session.get("stage") == "q_user_image":
                         filename = f"{room_id}_p1.jpg"
+
+                        # 1) Download the WhatsApp image locally
                         try:
                             abs_path = await download_whatsapp_media_to_file(media_id, filename)
                         except Exception as e:
                             logger.exception(f"Failed to download user image: {e}")
-                            background_tasks.add_task(send_text, from_phone, "Couldn’t read that image. Please resend.")
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "Couldn’t read that image. Please resend your photo as an *image*.",
+                            )
                             continue
 
                         session["user_image_path"] = abs_path
+
+                        # 2) Upload selfie to your uploads bucket (same as before, if you still want it)
                         try:
                             key1 = s3_key_for_user_upload(room_id, "p1")
-                            upload_file_to_s3(session["user_image_path"], key1, cache_control="private, max-age=31536000")
-                            session["user_image_url"] = presign_get_url(key1, expires=3600)
+                            upload_file_to_s3(
+                                session["user_image_path"],
+                                key1,
+                                cache_control="private, max-age=31536000",
+                            )
+                            user_image_url = presign_get_url(key1, expires=3600)
+
+                            session["user_image_url"] = user_image_url
                             session["updated_at_utc"] = now_utc_iso()
                             session["updated_at_ist"] = now_ist_iso()
                             background_tasks.add_task(save_session_snapshot, from_phone, session)
+
                             logger.info(f"[S3] Uploaded user image -> s3://{S3_GF_BUCKET}/{key1}")
                         except Exception as e:
                             logger.exception(f"S3 upload/presign failed (user image): {e}")
-                            background_tasks.add_task(send_text, from_phone, "Upload failed. Please try again.")
-                            continue
-
-                        # ---- NEW: gate next step on buddy_consent ----
-                        job_doc = await users_collection_goldflake.find_one(
-                            {"room_id": room_id},
-                            {"buddy_consent": 1}
-                        )
-                        consent = (job_doc or {}).get("buddy_consent")
-
-                        if consent == "disagree":
-                            # buddy explicitly refused
                             background_tasks.add_task(
                                 send_text,
                                 from_phone,
-                                "Your buddy did not agree to the terms. Sorry, we can’t proceed with this flow.",
+                                "Upload failed. Please try sending your photo again.",
                             )
-                            await end_session(from_phone, reason="buddy_disagreed")
                             continue
 
-                        if consent == "agree":
-                            # buddy has already agreed -> allow buddy photo stage
-                            session["stage"] = "q_buddy_image"
+                        # 3) Collect required fields from the session
+                        scene = session.get("scene")    # final_profile
+                        name = session.get("name")
+                        gender = session.get("gender")
+                        image_url = session.get("user_image_url")
+
+                        if not scene or not name or not gender or not image_url:
+                            logger.error(
+                                f"[single_user_flow] Missing data before generation for {from_phone}: "
+                                f"scene={scene}, name={name}, gender={gender}, img_url_present={bool(image_url)}"
+                            )
+                            background_tasks.add_task(
+                                send_text,
+                                from_phone,
+                                "We’re missing some details. Please type *hi* to restart.",
+                            )
+                            session["stage"] = "t_and_c"
                             session["updated_at_utc"] = now_utc_iso()
                             session["updated_at_ist"] = now_ist_iso()
                             background_tasks.add_task(save_session_snapshot, from_phone, session)
-
-                            background_tasks.add_task(
-                                send_text,
-                                from_phone,
-                                "Got your photo 👍\n\nNow send your *buddy’s* photo here as an image.",
-                            )
                             continue
 
-                        
-                        # consent is missing / None -> we need to send the consent link now and wait
-                        session["stage"] = "waiting_for_buddy_approval"
+                        # 4) Tell user we are generating
+                        background_tasks.add_task(
+                            send_text,
+                            from_phone,
+                            "Perfect! Creating your poster... One moment",
+                        )
+
+                        # 5) Background worker: run Comfy + send image on WhatsApp
+                        async def _generate_and_send_single(
+                            from_phone: str,
+                            room_id: str,
+                            scene: str,
+                            name: str,
+                            gender: str,
+                            image_url: str,
+                        ) -> None:
+                            try:
+                                # run_comfy_workflow_and_send_image is sync; run in a thread
+                                result = await asyncio.to_thread(
+                                    run_comfy_workflow_and_send_image,
+                                    room_id,    # sender
+                                    name,       # name
+                                    gender,     # gender
+                                    scene,      # final_profile
+                                    image_url,  # selfie URL (upload)
+                                )
+
+                                if not isinstance(result, dict) or not result.get("success"):
+                                    err = (result or {}).get("error", "unknown error")
+                                    logger.error(f"[single_user_flow] generation failed: {err}")
+                                    await send_text(
+                                        from_phone,
+                                        "Generation failed. Please try again later.",
+                                    )
+                                    return
+
+                                upload_key = result.get("s3_key")
+                                if not upload_key:
+                                    logger.error("[single_user_flow] missing s3_key in result")
+                                    await send_text(
+                                        from_phone,
+                                        "Generation failed. Please try again later.",
+                                    )
+                                    return
+
+                                # Wait for S3 object to exist (defensive)
+                                for _ in range(120):
+                                    try:
+                                        _s3.head_object(Bucket=S3_BUCKET, Key=upload_key)
+                                        break
+                                    except Exception:
+                                        await asyncio.sleep(1)
+                                else:
+                                    logger.error(
+                                        f"[single_user_flow] timed out waiting for S3 key: {upload_key}"
+                                    )
+                                    await send_text(
+                                        from_phone,
+                                        "Upload is taking longer than expected. Please try again shortly.",
+                                    )
+                                    return
+
+                                # Build public URL (object is ACL=public-read)
+                                s3_url = (
+                                    f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{upload_key}"
+                                )
+
+                                # Send final image to the user on WhatsApp
+                                await send_image_by_link(
+                                    to_phone=from_phone,
+                                    url=s3_url,
+                                    caption="Here it is! Hope you love it❤️",
+                                )
+
+                                # Mark session as done & snapshot
+                                try:
+                                    sess = get_active_session(from_phone)
+                                    if sess and sess.get("room_id") == room_id:
+                                        sess["final_image_url"] = s3_url
+                                        sess["status"] = "done"
+                                        sess["stage"] = "done"
+                                        sess["updated_at_utc"] = now_utc_iso()
+                                        sess["updated_at_ist"] = now_ist_iso()
+                                        try:
+                                            asyncio.create_task(save_session_snapshot(from_phone, sess))
+                                        except Exception as e:
+                                            logger.exception(
+                                                f"[single_user_flow] failed to schedule save_session_snapshot (active): {e}"
+                                            )
+                                except Exception as e:
+                                    logger.exception(
+                                        f"[single_user_flow] Exception while preparing final snapshot: {e}"
+                                    )
+
+                                # End in-memory session
+                                try:
+                                    archived = await end_session(from_phone, reason="completed_success")
+                                    if archived:
+                                        archived["final_image_url"] = archived.get("final_image_url", s3_url)
+                                        archived["status"] = "done"
+                                        archived["stage"] = "done"
+                                        try:
+                                            asyncio.create_task(
+                                                save_session_snapshot(from_phone, archived)
+                                            )
+                                        except Exception as e:
+                                            logger.exception(
+                                                f"[single_user_flow] failed to schedule save_session_snapshot (archived): {e}"
+                                            )
+                                except Exception as e:
+                                    logger.exception(
+                                        f"[single_user_flow] Failed to end session after generation: {e}"
+                                    )
+
+                            except Exception as e:
+                                logger.exception(f"[single_user_flow] Failed to generate/send image: {e}")
+                                try:
+                                    await send_text(
+                                        from_phone,
+                                        "Generation failed. Please try again later.",
+                                    )
+                                except Exception:
+                                    pass
+
+                        # Schedule background job
+                        background_tasks.add_task(
+                            fire_and_forget,
+                            _generate_and_send_single(
+                                from_phone,
+                                room_id,
+                                scene,
+                                name,
+                                gender,
+                                image_url,
+                            ),
+                        )
+
+                        # 6) Move session to processing
+                        session["stage"] = "processing"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
                         background_tasks.add_task(save_session_snapshot, from_phone, session)
 
-                        # If we have buddy's whatsapp (user earlier provided number), send link directly to buddy.
-                        buddy_wa = session.get("buddy_whatsapp") or session.get("buddy_phone") or None
-
-                        if buddy_wa:
-                            # send link directly to buddy's WA
-                            background_tasks.add_task(send_buddy_consent_message, buddy_wa, session.get("room_id"))
-                            # notify requester that we sent the link
-                            background_tasks.add_task(send_text, from_phone,
-                                "Got your photo 👍\n\nWe sent a consent link to your buddy. Ask them to open it and tap *I agree* so you can continue.")
-                        else:
-                            # send link to requester so they can forward it to their buddy
-                            
-                            background_tasks.add_task(send_text, from_phone,
-                                "Please forward the below message with your buddy")
-                            background_tasks.add_task(send_buddy_consent_message, from_phone, session.get("room_id"))
                         continue
+
 
 
                     # legacy branch: requester uploading buddy image (backwards compatibility)
                     if session.get("stage") == "q_buddy_image":
                         # ---- NEW: check buddy_consent again before accepting image ----
-                        job_doc = await users_collection_goldflake.find_one(
-                            {"room_id": room_id},
-                            {"buddy_consent": 1}
-                        )
-                        consent = (job_doc or {}).get("buddy_consent")
+                        # job_doc = await users_collection_goldflake.find_one(
+                        #     {"room_id": room_id},
+                        #     {"buddy_consent": 1}
+                        # )
+                        # consent = (job_doc or {}).get("buddy_consent")
 
-                        if consent == "disagree":
-                            background_tasks.add_task(
-                                send_text,
-                                from_phone,
-                                "Your buddy did not agree to the terms. Sorry, we can’t proceed with this flow.",
-                            )
-                            await end_session(from_phone, reason="buddy_disagreed")
-                            continue
+                        # if consent == "disagree":
+                        #     background_tasks.add_task(
+                        #         send_text,
+                        #         from_phone,
+                        #         "Your buddy did not agree to the terms. Sorry, we can’t proceed with this flow.",
+                        #     )
+                        #     await end_session(from_phone, reason="buddy_disagreed")
+                        #     continue
 
-                        if consent != "agree":
-                            # buddy hasn’t replied yet
-                            background_tasks.add_task(
-                                send_text,
-                                from_phone,
-                                "We’re still waiting for your buddy’s approval. "
-                                "Ask them to open the consent link and tap *I agree*.",
-                            )
-                            continue
+                        # if consent != "agree":
+                        #     # buddy hasn’t replied yet
+                        #     background_tasks.add_task(
+                        #         send_text,
+                        #         from_phone,
+                        #         "We’re still waiting for your buddy’s approval. "
+                        #         "Ask them to open the consent link and tap *I agree*.",
+                        #     )
+                        #     continue
 
                         # consent == "agree" → allow buddy image upload
                         filename = f"{room_id}_p2.jpg"
@@ -2413,7 +2546,7 @@ async def send_scene_question(to_phone: str):
         "interactive": {
             "type": "list",
             "body": {
-                "text": "Select a background for your picture"
+                "text": "Pick a background for your poster"
             },
             "action": {
                 "button": "Choose Scene",
@@ -2422,9 +2555,9 @@ async def send_scene_question(to_phone: str):
                         "title": "Scenes",
                         "rows": [
                             {
-                                "id": "scene_big_ben",
-                                "title": "Big Ben",
-                                "description": "Big Ben"
+                                "id": "scene_clown",
+                                "title": "Clown",
+                                "description": "clown"
                             },
                             {
                                 "id": "scene_rooftop",
@@ -2452,7 +2585,7 @@ async def send_scene_question(to_phone: str):
 
 # --- Ask for name (plain text) ---
 async def send_name_question(to_phone: str):
-    await send_text(to_phone, "What’s your name? (Please reply with text)")
+    await send_text(to_phone, "Awesome choice! What's your name?")
 
 # --- Buttons: Your gender (male / female) ---
 async def send_gender_question(to_phone: str):
@@ -2463,7 +2596,7 @@ async def send_gender_question(to_phone: str):
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": "What is your gender?"},
+            "body": {"text": "What's your gender"},
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": "gender_me_male", "title": "Male"}},

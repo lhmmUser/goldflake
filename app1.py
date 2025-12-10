@@ -155,186 +155,206 @@ def generate_random_seed() -> int:
     return random.SystemRandom().randint(1, 9_999_999)
 
 
-def run_comfy_workflow_and_send_image(sender: str, name: str, gender: str, final_profile: str, image_url: str):
+def run_comfy_workflow_and_send_image(
+    sender: str,
+    name: str,
+    gender: str,
+    final_profile: str,
+    image_url: str,
+):
+    """
+    Single-person version.
+
+    Runs the ComfyUI workflow, uploads the final JPEG to S3_BUCKET, and RETURNS:
+      {
+        "success": True,
+        "s3_key": "<key used in S3>",
+        "jpeg_bytes": <bytes of final JPEG>
+      }
+    On failure:
+      {"success": False, "error": "<reason>"}.
+    """
     client_id = str(uuid.uuid4())
     print(
-        f"👤 Starting image generation for: {name}, {gender}, {final_profile}")
-    gender = gender.lower()
+        f"👤 [single] start: sender={sender} name={name} gender={gender} profile={final_profile}"
+    )
+
+    gender = (gender or "").strip().lower()
     folder_key = profile_to_folder.get(final_profile)
     if not folder_key:
-        print(f"❌ Unknown profile '{final_profile}' — no matching folder_key.")
-
-        return
+        err = f"Unknown profile '{final_profile}' — no matching folder_key."
+        print(f"❌ [single] {err}")
+        return {"success": False, "error": err}
 
     workflow_path = os.path.join(
-        comfy_input_root, "df", gender, folder_key, f"{folder_key}.json")
-    print("🧩 Using workflow path:", workflow_path)
+        comfy_input_root, "df", gender, folder_key, f"{folder_key}.json"
+    )
+    print("🧩 [single] workflow path:", workflow_path)
 
     try:
         with open(workflow_path, "r", encoding="utf-8") as f:
             jsonwf = json.load(f)
-        print("✅ Workflow loaded successfully.")
+        print("✅ [single] workflow loaded successfully.")
     except Exception as e:
-        print(f"❌ Failed to load workflow: {e}")
+        err = f"Failed to load workflow: {e}"
+        print(f"❌ [single] {err}")
+        return {"success": False, "error": err}
 
-        return
+    # ---------- inject name into node 68 (best-effort) ----------
+    try:
+        if "68" in jsonwf and "inputs" in jsonwf["68"]:
+            caps_name = name.upper()
+            jsonwf["68"]["inputs"]["value"] = caps_name
+            print(f"📝 [single] Injected name '{name}' into node 68.")
+        else:
+            print("⚠️ [single] Node 68 not found or missing inputs.")
+    except Exception as e:
+        print(f"⚠️ [single] name inject error: {e}")
 
-    if "68" in jsonwf and "inputs" in jsonwf["68"]:
-        caps_name = name.upper()
-        jsonwf["68"]["inputs"]["value"] = caps_name
-        print(f"📝 Injected name '{name}' into node 68.")
-    else:
-        print("⚠️ Node 68 not found or missing inputs.")
-
-    # Save selfie
-    ext = image_url.lower().split('.')[-1]
+    # ---------- download selfie to comfy input folder ----------
+    ext = image_url.lower().split(".")[-1]
     user_image_rel_path = os.path.join("user_images", f"{sender}_input.png")
     user_image_abs_path = os.path.join(comfy_input_root, user_image_rel_path)
     os.makedirs(os.path.dirname(user_image_abs_path), exist_ok=True)
-    print("📥 Preparing to download selfie from:", image_url)
+    print("📥 [single] Preparing to download selfie from:", image_url)
 
     try:
         selfie_bytes = urllib.request.urlopen(image_url).read()
-
         image = Image.open(BytesIO(selfie_bytes))
         image.save(user_image_abs_path)
-        print(f"✅ Selfie saved to {user_image_abs_path}")
+        print(f"✅ [single] Selfie saved to {user_image_abs_path}")
     except Exception as e:
-        print("❌ Failed to download/save selfie:", e)
+        err = f"Failed to download/save selfie: {e}"
+        print("❌ [single]", err)
+        return {"success": False, "error": err}
 
-        return
+    # ---------- inject adapter / controlnet / selfie path ----------
+    try:
+        if "4" in jsonwf and "inputs" in jsonwf["4"]:
+            instantid_file_path = IP_ADAPTER
+            jsonwf["4"]["inputs"]["instantid_file"] = instantid_file_path
+            print(f"🧠 [single] Node 4 instantid_file -> {instantid_file_path}")
+        else:
+            print("⚠️ [single] Node 4 missing or has no inputs.")
+    except Exception as e:
+        print(f"⚠️ [single] node 4 inject error: {e}")
 
-    if "4" in jsonwf and "inputs" in jsonwf["4"]:
-        instantid_file_path = IP_ADAPTER
-        print(IP_ADAPTER, "IP_ADAPTER",
-              instantid_file_path, "instantid_file_path")
-        jsonwf["4"]["inputs"]["instantid_file"] = instantid_file_path
-        print(
-            f"🧠 Injected instantid_file into node 4: {instantid_file_path}")
+    try:
+        if "6" in jsonwf and "inputs" in jsonwf["6"]:
+            control_net_file_path = PYTORCH_MODEL
+            jsonwf["6"]["inputs"]["control_net_name"] = control_net_file_path
+            print(f"🧠 [single] Node 6 control_net_name -> {control_net_file_path}")
+        else:
+            print("⚠️ [single] Node 6 missing or has no inputs.")
+    except Exception as e:
+        print(f"⚠️ [single] node 6 inject error: {e}")
 
-    if "6" in jsonwf and "inputs" in jsonwf["4"]:
-        control_net_file_path = PYTORCH_MODEL
-        jsonwf["6"]["inputs"]["control_net_name"] = control_net_file_path
-        print(
-            f"🧠 Injected control_net_name into node 6: {control_net_file_path}")
+    try:
+        if "12" in jsonwf and "inputs" in jsonwf["12"]:
+            jsonwf["12"]["inputs"]["image"] = user_image_rel_path.replace("\\", "/")
+            print(
+                f"🧠 [single] Node 12 image -> {user_image_rel_path}"
+            )
+        else:
+            print("⚠️ [single] Node 12 not found in workflow.")
+    except Exception as e:
+        print(f"⚠️ [single] node 12 inject error: {e}")
 
-    if "12" in jsonwf and "inputs" in jsonwf["12"]:
-        jsonwf["12"]["inputs"]["image"] = user_image_rel_path.replace(
-            "\\", "/")
-        print(f"🧠 Injected selfie path into node 12: {user_image_rel_path}")
-    else:
-        print("⚠️ Node 12 not found in workflow.")
-
-    # Workflow execution
+    # ---------- ComfyUI execution helpers ----------
     def queue_prompt(prompt):
         p = {"prompt": prompt, "client_id": client_id}
         data = json.dumps(p).encode("utf-8")
         req = urllib.request.Request(
-            f"http://{server_address}/prompt", data=data)
-        print("🚀 Queuing prompt to ComfyUI...")
+            f"http://{server_address}/prompt", data=data
+        )
+        print("🚀 [single] Queuing prompt to ComfyUI...")
         return json.loads(urllib.request.urlopen(req).read())
 
     def get_image(filename, subfolder, folder_type):
-        data = {"filename": filename,
-                "subfolder": subfolder, "type": folder_type}
+        data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
         url_values = urllib.parse.urlencode(data)
-        print("📸 Fetching image from ComfyUI output...")
-        with urllib.request.urlopen(f"http://{server_address}/view?{url_values}") as response:
+        print("📸 [single] Fetching image from ComfyUI output...")
+        with urllib.request.urlopen(
+            f"http://{server_address}/view?{url_values}"
+        ) as response:
             return response.read()
 
     def get_history(prompt_id):
-        print("🕓 Fetching workflow history...")
-        with urllib.request.urlopen(f"http://{server_address}/history/{prompt_id}") as response:
+        print("🕓 [single] Fetching workflow history...")
+        with urllib.request.urlopen(
+            f"http://{server_address}/history/{prompt_id}"
+        ) as response:
             return json.loads(response.read())
 
     def get_images(ws, prompt):
         prompt_id = queue_prompt(prompt)["prompt_id"]
-        print(f"🆔 Prompt ID: {prompt_id}")
+        print(f"🆔 [single] Prompt ID: {prompt_id}")
         while True:
             out = ws.recv()
             if isinstance(out, str):
                 message = json.loads(out)
-                if message["type"] == "executing":
-                    data = message["data"]
-                    if data["node"] is None and data["prompt_id"] == prompt_id:
-                        print("✅ Workflow execution completed.")
+                if message.get("type") == "executing":
+                    data = message.get("data", {})
+                    if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                        print("✅ [single] Workflow execution completed.")
                         break
         history = get_history(prompt_id)[prompt_id]
-        for node_id, output in history["outputs"].items():
+        for node_id, output in history.get("outputs", {}).items():
             if "images" in output:
                 img = output["images"][0]
                 return get_image(img["filename"], img["subfolder"], img["type"])
         return None
 
     try:
-        print("🔌 Connecting to ComfyUI WebSocket...")
+        print("🔌 [single] Connecting to ComfyUI WebSocket...")
         ws = websocket.WebSocket()
         ws.connect(f"ws://{server_address}/ws?clientId={client_id}")
         image_result = get_images(ws, jsonwf)
         ws.close()
 
-        if image_result:
-            # NEW: force JPEG re-encode
-            jpeg_bytes = transcode_to_jpeg(image_result)
+        if not image_result:
+            err = "image generation failed or returned nothing"
+            print("⚠️ [single]", err)
+            return {"success": False, "error": err}
 
-            # keep .jpg to match your GET filters
-            key = s3_key(sender, final_profile)
-            try:
-                s3.put_object(
-                    Bucket=S3_BUCKET,
-                    Key=key,
-                    Body=jpeg_bytes,
-                    ContentType="image/jpeg",
-                    ACL="public-read"
-                )
+        # Force JPEG
+        jpeg_bytes = transcode_to_jpeg(image_result)
 
-                print(f"✅ Uploaded to S3: s3://{S3_BUCKET}/{key}")
+        # ---------- upload to S3 ----------
+        key = s3_key(sender, final_profile)  # same pattern as before
+        try:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=key,
+                Body=jpeg_bytes,
+                ContentType="image/jpeg",
+                ACL="public-read",
+            )
+            print(f"✅ [single] Uploaded to S3: s3://{S3_BUCKET}/{key}")
+        except Exception as e:
+            err = f"Failed to upload image to S3: {e}"
+            print("❌ [single]", err)
+            return {"success": False, "error": err}
 
-                try:
-                    requests.post(
-                        f"{INTERNAL_BASE_URL}/internal/mark-uploaded",
-                        json={"room_id": sender, "campaign": "darkfantasy"},
-                        timeout=5,
-                    )
-                except Exception as e:
-                    print("⚠️ Could not notify internal /internal/mark-uploaded:", e)
-
-                # Optionally send WhatsApp preview
-                encoded_image = base64.b64encode(image_result).decode("utf-8")
-
-                try:
-
-                    chat360_url_df = settings.CHAT360_URL_DF
-                    payload = {
-                        "room_id": sender,
-                        "keyword": "hyperverge status"
-                    }
-                    headers = {"Content-Type": "application/json"}
-                    response = requests.post(
-                        chat360_url_df, json=payload, headers=headers)
-                    if response.status_code == 200:
-                        print("📣 Chat360 notified successfully.")
-                    else:
-                        print(
-                            f"⚠️ Failed to notify Chat360: {response.status_code} - {response.text}")
-                except Exception as e:
-                    print("❌ Error notifying Chat360:", e)
-
-            except Exception as e:
-                print("❌ Failed to upload image to S3:", e)
-
-        else:
-            print("⚠️ Image generation failed or returned nothing.")
+        # ---------- success ----------
+        return {
+            "success": True,
+            "s3_key": key,
+            "jpeg_bytes": jpeg_bytes,
+        }
 
     except Exception as e:
-        print("❌ Error during ComfyUI execution:", e)
+        err = f"Error during ComfyUI execution: {e}"
+        print("❌ [single]", err)
+        return {"success": False, "error": err}
 
-    # Cleanup selfie
-    try:
-        os.remove(user_image_abs_path)
-        print(f"🧹 Deleted temporary selfie: {user_image_abs_path}")
-    except Exception as e:
-        print("⚠️ Could not delete selfie:", e)
+    finally:
+        # Cleanup selfie
+        try:
+            os.remove(user_image_abs_path)
+            print(f"🧹 [single] Deleted temporary selfie: {user_image_abs_path}")
+        except Exception as e:
+            print("⚠️ [single] Could not delete selfie:", e)
 
 
 def run_comfy_workflow_and_send_image_sf(sender: str, name: str, gender: str, final_profile: str, image_url: str, age: str):
@@ -540,17 +560,7 @@ def presign_get_url(key: str, expires: int = 3600) -> str:
         ExpiresIn=expires,
     )
 
-def run_comfy_workflow_and_send_image_goldflake(
-    sender: str,
-    gender: str,
-    final_profile: str,
-    person1_input_image: str,
-    person2_input_image: str,
-    person1_name: str,
-    person2_name: str,
-    archetype: str | None = "chai",
-    upload_key: Optional[str] = None,
-):
+def run_comfy_workflow_and_send_image_goldflake(sender: str,gender: str,final_profile: str,person1_input_image: str,person2_input_image: str,person1_name: str,person2_name: str,archetype: str | None = "chai",upload_key: Optional[str] = None):
     """
     Runs the ComfyUI workflow, uploads the final JPEG to S3, and RETURNS:
       {
