@@ -546,6 +546,8 @@ def run_comfy_workflow_and_send_image_goldflake(
     final_profile: str,
     person1_input_image: str,
     person2_input_image: str,
+    person1_name: str,
+    person2_name: str,
     archetype: str | None = "chai",
     upload_key: Optional[str] = None,
 ):
@@ -664,6 +666,30 @@ def run_comfy_workflow_and_send_image_goldflake(
             print("⚠️ [goldflake] node '129:3' missing; control_net_name not injected")
     except Exception as e:
         print(f"⚠️ [goldflake] 129:3 inject error: {e}")
+
+        # ---------- inject person names into text nodes (131, 133) ----------
+    try:
+        node_131 = jsonwf.get("131")
+        if isinstance(node_131, dict) and isinstance(node_131.get("inputs"), dict):
+            # if your workflow uses a different key than "value" (e.g. "text"),
+            # change "value" below accordingly.
+            node_131["inputs"]["value"] = person1_name
+            print(f"🧠 [goldflake] node 131 value -> {person1_name}")
+        else:
+            print("⚠️ [goldflake] node 131 missing or has no inputs; person1 name not injected")
+    except Exception as e:
+        print(f"⚠️ [goldflake] node 131 name inject error: {e}")
+
+    try:
+        node_133 = jsonwf.get("133")
+        if isinstance(node_133, dict) and isinstance(node_133.get("inputs"), dict):
+            # same note as above: adjust 'value' to match your workflow JSON key
+            node_133["inputs"]["value"] = person2_name
+            print(f"🧠 [goldflake] node 133 value -> {person2_name}")
+        else:
+            print("⚠️ [goldflake] node 133 missing or has no inputs; person2 name not injected")
+    except Exception as e:
+        print(f"⚠️ [goldflake] node 133 name inject error: {e}")
 
     # ---------- ComfyUI execution ----------
     try:

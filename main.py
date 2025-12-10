@@ -40,7 +40,7 @@ SESSIONS: Dict[str, Dict[str, Any]] = {}
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_GF_BUCKET = os.getenv("S3_GF_BUCKET") or os.environ["S3_GF_BUCKET"]
 GRAPH_BASE = "https://graph.facebook.com/v21.0" 
-BUDDY_CONSENT_URL = os.getenv("BUDDY_CONSENT_URL", "https://darkfantasy-en.diffrun.com")
+BUDDY_CONSENT_URL = os.getenv("BUDDY_CONSENT_URL", "http://127.0.0.1:8000")
 INTERNAL_TOKEN = os.getenv("INTERNAL_INTERNAL_TOKEN", "super-secret")
 # in-memory stores (you may replace with persistent DB later)
 _sessions_active: Dict[str, Dict[str, Any]] = {}   # phone_key -> active session dict
@@ -478,6 +478,9 @@ async def generate_for_pair(
         # We'll read stored genders from DB if available
         job_doc = await users_collection_goldflake.find_one({"room_id": room_id})
         user_gender = (job_doc.get("person1_gender") or "").lower().strip() if job_doc else ""
+        person1_name = (job_doc.get("person1_name") or "").strip() if job_doc else ""
+        person2_name = (job_doc.get("person2_name") or "").strip() if job_doc else ""
+        
         buddy_doc = None
         buddy_gender = ""
         if buddy_phone:
@@ -510,7 +513,7 @@ async def generate_for_pair(
 
         # Run the generator in a thread (this mirrors existing _run usage)
         try:
-            result = await asyncio.to_thread(_run, room_id, combined_gender_folder, scene, p1, p2, upload_key, archetype_combined)
+            result = await asyncio.to_thread(_run, room_id, combined_gender_folder, scene, p1, p2, upload_key, archetype_combined, person1_name, person2_name)
         except Exception as e:
             logger.exception("[gen] synchronous generator _run failed for room_id=%s: %s", room_id, e)
             await send_text(requester_phone, "Generation failed due to an internal error. Please try again later.")
@@ -857,7 +860,7 @@ async def send_text(to_phone: str, text: str):
             logger.info(f"Sent text to {to_phone}: {text}")
 
 
-UPLOAD_DIR = os.environ.get("UPLOAD_DIR", r"C:\Users\Haripriya\goldflake-main\user_uploads")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", r"D:\Haripriya\goldflake-main\user_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def _safe_name(name: str) -> str:
@@ -1124,7 +1127,9 @@ def _run(room_id: str,
                 p1_url: str,
                 p2_url: str,
                 upload_key: str,
-                archetype_for_comfy: str) -> dict:
+                archetype_for_comfy: str,
+                person1_name: str = "",
+                person2_name: str = "",) -> dict:
             """
             Runs the generator synchronously (in a worker thread) using a deterministic upload_key.
             Returns the dict from run_comfy_workflow_and_send_image_goldflake.
@@ -1136,6 +1141,8 @@ def _run(room_id: str,
                     final_profile=scene,               # "chai" or "rooftop"
                     person1_input_image=p1_url,
                     person2_input_image=p2_url,
+                    person1_name=person1_name,
+                    person2_name=person2_name,
                     archetype=archetype_for_comfy,   # e.g., "chai" or "rooftop"
                     upload_key=upload_key,             # 🔸 deterministic key chosen by caller
                 )
@@ -1201,7 +1208,7 @@ async def webhook_goldflake(
             logger.error(f"[goldflake] {err}")
             return {"error": err}
 
-        archetype_norm = (archetype or "london_dreams").strip().lower()                # scene/archetype normalized
+        archetype_norm = (archetype or "big_ben").strip().lower()                # scene/archetype normalized
 
         # ---- Record request metadata (non-blocking if it fails) ----
         now_utc, now_ist = now_utc_and_ist()                                  # your time helper
@@ -1282,6 +1289,8 @@ async def webhook_goldflake(
                 scene: str,
                 p1_url: str,
                 p2_url: str,
+                person1_name:str,
+                person2_name:str,
                 upload_key: str,
                 archetype_for_comfy: str) -> dict:
             """
@@ -1295,6 +1304,8 @@ async def webhook_goldflake(
                     final_profile=scene,               # "chai" or "rooftop"
                     person1_input_image=p1_url,
                     person2_input_image=p2_url,
+                    person1_name=person1_name,
+                    person2_name=person2_name,
                     archetype=archetype_for_comfy,
                     upload_key=upload_key,             # 🔸 deterministic key chosen by caller
                 )
@@ -1559,8 +1570,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         background_tasks.add_task(send_text, from_phone, "No worries. You can come back anytime to accept and continue 👋")
                         continue
 
-                    if st == "q_scene" and choice_id in {"scene_london_dreams", "scene_rooftop"}:
-                        session["scene"] = "london_dreams" if choice_id == "scene_london_dreams" else "chai_2"
+                    if st == "q_scene" and choice_id in {"scene_big_ben", "scene_rooftop"}:
+                        session["scene"] = "big_ben" if choice_id == "scene_big_ben" else "chai_2"
                         session["stage"] = "q_name"
                         session["updated_at_utc"] = now_utc_iso()
                         session["updated_at_ist"] = now_ist_iso()
@@ -2024,7 +2035,8 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                         user_gender = session["gender"]
                         buddy_gender = session["buddy_gender"]
                         
-                        
+                        person1_name = session["name"]
+                        person2_name = session["buddy_name"]
 
                         archetype_combined = scene
 
@@ -2037,13 +2049,16 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                                     buddy_gender: str,
                                                     p1_url: str,
                                                     p2_url: str,
-                                                    archetype_combined: str) -> None:
+                                                    archetype_combined: str,
+                                                    person1_name:str,
+                                                    person2_name:str
+                                                   ) -> None:
                             """
                             Generate the image for the requester (from_phone). After sending to requester,
                             attempt to also send the final image to the buddy (if we can determine their WA number).
                             """
                             try:
-                                await send_text(from_phone, "Please wait while we generate your 'London Dreams' Poster")
+                                await send_text(from_phone, "Please wait while we generate your 'Big Ben' Poster")
 
                                 upload_key = s3_key(room_id, scene)
 
@@ -2059,11 +2074,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
                                 if combined_gender_folder not in {"male_male", "male_female", "female_female"}:
                                     await send_text(from_phone, "Invalid gender combination.")
                                     return
+                                
+                                # 🔹 NEW: pull names from the current session
+                                # (session is closed over from the outer scope)
+                                
 
                                 logger.info(f"[goldflake] archetype_combined={archetype_combined} upload_key={upload_key}")
 
                                 result = await asyncio.to_thread(
-                                    _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key, archetype_combined
+                                    _run, room_id, combined_gender_folder, scene, p1_url, p2_url, upload_key, archetype_combined,person1_name, person2_name
                                 )
 
                                 if not (isinstance(result, dict) and result.get("success")):
@@ -2147,7 +2166,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
       # schedule the generation (non-blocking)
                         background_tasks.add_task(
                             fire_and_forget,
-                            _generate_and_send(from_phone, room_id, scene, user_gender, buddy_gender, p1_url, p2_url, archetype_combined)
+                            _generate_and_send(from_phone, room_id, scene, user_gender, buddy_gender, p1_url, p2_url, archetype_combined, person1_name, person2_name)
                         )
 
                         session["stage"] = "processing"
@@ -2403,9 +2422,9 @@ async def send_scene_question(to_phone: str):
                         "title": "Scenes",
                         "rows": [
                             {
-                                "id": "scene_london_dreams",
-                                "title": "London Bridge",
-                                "description": "London Bridge"
+                                "id": "scene_big_ben",
+                                "title": "Big Ben",
+                                "description": "Big Ben"
                             },
                             {
                                 "id": "scene_rooftop",
