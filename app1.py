@@ -204,7 +204,7 @@ def run_comfy_workflow_and_send_image(
     # ---------- inject name into node 68 (best-effort) ----------
     try:
         if "68" in jsonwf and "inputs" in jsonwf["68"]:
-            caps_name = name.upper()
+            caps_name = name.capitalize()
             jsonwf["68"]["inputs"]["value"] = caps_name
             print(f"📝 [single] Injected name '{name}' into node 68.")
         else:
