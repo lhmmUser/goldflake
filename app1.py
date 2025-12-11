@@ -62,6 +62,7 @@ profile_to_folder = {
     "mummy": "df_mummy",
     "zombie": "df_zombie",
     "pirate": "df_pirate",
+    "big_ben":"big_ben"
 }
 
 profile_to_folder_sf = {
